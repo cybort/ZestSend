@@ -112,6 +112,8 @@ type PendingWorkerOperation = {
 type FileTransferCallbacks = {
   sendControl: (message: WireMessage) => boolean;
   sendBulk: (data: ArrayBuffer) => boolean;
+  /** Event-driven capacity check; avoids timer polling that hidden tabs throttle. */
+  waitForBulkCapacity?: (signal: AbortSignal) => Promise<boolean>;
   onUpdate: (file: FileTransferSnapshot) => void;
   onOffer: (file: FileTransferSnapshot) => void;
   onError: (id: string, error: string) => void;
@@ -748,7 +750,7 @@ export class FileTransferManager {
       const encoded = encodeSegment({ blockIndex, blockLength: data.byteLength, payload, segmentCount, segmentIndex, transferId: record.id });
       let sent = this.callbacks.sendBulk(encoded);
       while (!sent && this.isActiveSend(record, generation, signal)) {
-        if (!await this.waitForSendRetry(signal) || !this.isActiveSend(record, generation, signal)) return;
+        if (!await this.waitForSendRetry(signal, true) || !this.isActiveSend(record, generation, signal)) return;
         sent = this.callbacks.sendBulk(encoded);
       }
       if (!sent || !this.isActiveSend(record, generation, signal)) return;
@@ -772,7 +774,7 @@ export class FileTransferManager {
     record.blockSizes.delete(blockIndex);
   }
 
-  private waitForSendRetry(signal: AbortSignal): Promise<boolean> {
+  private waitForSendRetry(signal: AbortSignal, waitForCapacity = false): Promise<boolean> {
     if (signal.aborted) return Promise.resolve(false);
     return new Promise((resolve) => {
       let settled = false;
@@ -786,6 +788,14 @@ export class FileTransferManager {
       const handleAbort = () => finish(false);
       const timer = window.setTimeout(() => finish(true), 40);
       signal.addEventListener("abort", handleAbort, { once: true });
+      // Timer polling is throttled in hidden tabs; for bulk sends race the
+      // timer with the channel's bufferedamountlow event so pumping continues
+      // in background. Control retries keep the timer to avoid busy loops.
+      if (waitForCapacity && this.callbacks.waitForBulkCapacity) {
+        void this.callbacks.waitForBulkCapacity(signal).then((ready) => {
+          if (ready) finish(true);
+        }, () => undefined);
+      }
     });
   }
 

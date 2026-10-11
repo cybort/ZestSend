@@ -101,6 +101,7 @@ import {
   restoreSlotId,
   clearRoomStorage,
 } from "../lib/room-persistence";
+import { WakeLockManager } from "../lib/background";
 
 type StatusRowProps = {
   icon: typeof RiRouterLine;
@@ -2941,6 +2942,34 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     }
   }, [canvasHasContent, roomId]);
 
+  // Background-tab lifecycle: probe liveness and sync the mailbox on return to
+  // the foreground; refresh transfer progress UI after throttled updates.
+  useEffect(() => {
+    const handleVisibility = () => {
+      const visible = document.visibilityState !== "hidden";
+      sessionRef.current?.handleVisibilityChange(visible);
+      if (visible && fileTransfersRef.current.length) setFileTransfers([...fileTransfersRef.current]);
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, []);
+
+  // Keep the screen (and therefore capture/playback) alive while media is active.
+  const wakeLockManagerRef = useRef<WakeLockManager | null>(null);
+  useEffect(() => {
+    const manager = new WakeLockManager();
+    wakeLockManagerRef.current = manager;
+    return () => {
+      manager.destroy();
+      wakeLockManagerRef.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    wakeLockManagerRef.current?.setWanted(
+      microphoneActive || cameraActive || screenShareActive || remoteVoiceActive || remoteVideoActive || sharedPlayback !== null,
+    );
+  }, [microphoneActive, cameraActive, screenShareActive, remoteVoiceActive, remoteVideoActive, sharedPlayback]);
+
   const [progress, setProgress] = useState<ConnectionProgress>({
     websocket: { state: "pending", detail: "Waiting for signaling socket" },
     resource: { state: "pending", detail: "Waiting to request Cloudflare resources" },
@@ -3040,6 +3069,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       },
       sendBulk: (data) => sessionRef.current?.sendBulk(data) ?? false,
       sendControl: (message) => sessionRef.current?.sendControlMessage(message) ?? false,
+      waitForBulkCapacity: (signal) => sessionRef.current?.waitForBulkCapacity(signal) ?? Promise.resolve(false),
     });
     fileManagerRef.current = manager;
     return () => {

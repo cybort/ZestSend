@@ -44,6 +44,7 @@ export type WebRTCTransportDiagnostics = {
 import type { FileTransferManager, FileTransferSnapshot } from "./file-transfer";
 import { MediaTransport, type MediaSlotControlMessage } from "./media-transport";
 import { isSharedPlaybackMessage, type SharedPlaybackMessage } from "./shared-playback";
+import { heartbeatMissLimit, isPageHidden } from "./background";
 import {
   ROOM_DISCONNECTED_LEASE_MS,
   SIGNALING_HEARTBEAT_CAPABILITY,
@@ -124,6 +125,8 @@ type DataChannelName = "bulk" | "collaboration" | "control" | "interactive";
 
 const DATA_CHANNEL_NAMES: DataChannelName[] = ["control", "interactive", "bulk", "collaboration"];
 const DATA_CHANNEL_COUNT = DATA_CHANNEL_NAMES.length;
+/** Resume bulk sends once the buffer drains below this watermark (the hard cap in sendOnChannel is 3MB). */
+const BULK_BUFFERED_LOW_THRESHOLD = 2 * 1024 * 1024;
 const textEncoder = new TextEncoder();
 
 function isDataChannelName(label: string): label is DataChannelName {
@@ -684,6 +687,7 @@ export class NativeWebRTCSession {
   private receivedBytes = 0;
   private sentBytes = 0;
   private receivedChatIds = new Set<string>();
+  private bulkCapacityWaiters = new Set<(ready: boolean) => void>();
   private fileTransferManager: FileTransferManager | null = null;
   private mediaTransport: MediaTransport;
 
@@ -911,6 +915,38 @@ export class NativeWebRTCSession {
     const message = text.trim();
     if (!id || id.length > 128 || !message || message.length > 4_000) return false;
     return this.sendOnChannel("interactive", JSON.stringify({ id, text: message, type: "chat" satisfies InteractiveMessage["type"] }));
+  }
+
+  /**
+   * Resolves true once the bulk channel can accept more data (buffered amount
+   * below the watermark, via `bufferedamountlow`) instead of timer polling,
+   * which browsers throttle in background tabs. Resolves false when aborted
+   * or the channel is gone.
+   */
+  waitForBulkCapacity(signal?: AbortSignal): Promise<boolean> {
+    const channel = this.channels.bulk;
+    if (!channel || channel.readyState !== "open") return Promise.resolve(false);
+    if (signal?.aborted) return Promise.resolve(false);
+    if (channel.bufferedAmount <= BULK_BUFFERED_LOW_THRESHOLD) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (ready: boolean) => {
+        if (settled) return;
+        settled = true;
+        this.bulkCapacityWaiters.delete(finish);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(ready);
+      };
+      const onAbort = () => finish(false);
+      this.bulkCapacityWaiters.add(finish);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private notifyBulkCapacity(ready: boolean): void {
+    const waiters = [...this.bulkCapacityWaiters];
+    this.bulkCapacityWaiters.clear();
+    for (const waiter of waiters) waiter(ready);
   }
 
   private sendOnChannel(channelName: DataChannelName, data: string | ArrayBuffer | Blob): boolean {
@@ -1421,6 +1457,12 @@ export class NativeWebRTCSession {
       try { previous.close(); } catch { /* already closed */ }
     }
     this.channels[name] = channel; channel.binaryType = "arraybuffer"; this.updateDataChannelProgress();
+    if (name === "bulk") {
+      // Event-driven backpressure: senders await this threshold instead of
+      // polling timers, so transfers keep pumping while the tab is hidden.
+      channel.bufferedAmountLowThreshold = BULK_BUFFERED_LOW_THRESHOLD;
+      channel.onbufferedamountlow = () => this.notifyBulkCapacity(true);
+    }
     channel.onopen = () => {
       if (this.channels[name] !== channel || this.closed || this.suspended) return;
       this.updateDataChannelProgress(); if (name === "control") this.startDataChannelLatencyProbe();
@@ -1682,7 +1724,9 @@ export class NativeWebRTCSession {
       if (this.closed || this.suspended || generation !== this.socketGeneration || this.socket?.readyState !== WebSocket.OPEN) return;
       if (this.heartbeatStartedAt !== null) {
         this.heartbeatMisses += 1;
-        if (this.heartbeatMisses >= MAX_SIGNALING_HEARTBEAT_MISSES) { this.socket?.close(4_001, "Signaling heartbeat timeout"); return; }
+        // Hidden-tab timers are throttled, so misses while hidden are usually
+        // false alarms: widen the tolerance instead of tearing the socket down.
+        if (this.heartbeatMisses >= heartbeatMissLimit(MAX_SIGNALING_HEARTBEAT_MISSES, isPageHidden())) { this.socket?.close(4_001, "Signaling heartbeat timeout"); return; }
       }
       this.heartbeatStartedAt = performance.now();
       if (protocol === "auto-response-v3") {
@@ -1697,6 +1741,25 @@ export class NativeWebRTCSession {
     };
     sendHeartbeat();
     this.heartbeatTimer = window.setInterval(sendHeartbeat, SIGNALING_HEARTBEAT_INTERVAL_MS);
+  }
+
+  /**
+   * Foreground/lifecycle hook (visibilitychange). Returning to the foreground
+   * probes liveness immediately, revives a dead socket, and syncs the mailbox.
+   */
+  handleVisibilityChange(visible: boolean): void {
+    if (this.closed || this.suspended || !visible) return;
+    this.heartbeatMisses = 0;
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      if (this.hasAdmittedSeat || this.resumeToken) this.openSocket(this.reconnectMode);
+      return;
+    }
+    if (this.heartbeatProtocol === "auto-response-v3") {
+      try { this.socket.send(SIGNALING_HEARTBEAT_REQUEST); } catch { /* close event will handle retry */ }
+    } else {
+      this.sendSocket({ type: "ping" });
+    }
+    void this.pullMailboxMessages();
   }
 
   private handleSignalingHeartbeatResponse(): void {
@@ -1944,6 +2007,7 @@ export class NativeWebRTCSession {
   }
 
   private closeDataChannels(): void {
+    this.notifyBulkCapacity(false);
     const collaborationWasReady = this.collaborationReady;
     for (const name of DATA_CHANNEL_NAMES) {
       const channel = this.channels[name]; if (!channel) continue;

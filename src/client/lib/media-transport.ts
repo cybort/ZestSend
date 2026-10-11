@@ -1,3 +1,5 @@
+import { BACKGROUND_STATS_INTERVAL_MS } from "./background";
+
 export const MEDIA_SLOT_IDS = [
   "camera-audio",
   "camera-video",
@@ -91,6 +93,7 @@ export class MediaTransport {
   private pendingRemoteTracks: RemoteTrackEvent[] = [];
   private peer: RTCPeerConnection | null = null;
   private statsTimer: number | undefined;
+  private lastBackgroundStatsAt: number | null = null;
 
   constructor(
     private readonly sendControl: (message: MediaSlotControlMessage) => boolean,
@@ -328,6 +331,15 @@ export class MediaTransport {
 
   private async collectStats(): Promise<void> {
     if (!this.peer) return;
+    // Hidden tabs throttle timers anyway; skip the work so background stats
+    // cost stays flat and refresh at the background cadence instead.
+    if (document.visibilityState === "hidden") {
+      const now = performance.now();
+      if (this.lastBackgroundStatsAt !== null && now - this.lastBackgroundStatsAt < BACKGROUND_STATS_INTERVAL_MS) return;
+      this.lastBackgroundStatsAt = now;
+    } else {
+      this.lastBackgroundStatsAt = null;
+    }
     const now = performance.now();
     await Promise.all([...this.slots.values()].map(async (slot) => {
       if (!slot.sender || !slot.transceiver) return;
