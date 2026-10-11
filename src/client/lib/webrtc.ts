@@ -53,6 +53,20 @@ import {
   type SignalingHeartbeatProtocol,
 } from "../../shared/signaling-protocol";
 
+/** Encrypted mailbox types (Option C) */
+export type MailboxMessage = {
+  id: string;
+  fromSlot: string;
+  toSlot: string;
+  ciphertext: string; // base64url encoded
+  nonce: string; // base64url encoded
+  senderPubKey: string; // base64url encoded Ed25519 public key
+  signature: string; // base64url encoded
+  timestamp: number;
+  type: "chat" | "file-offer" | "control";
+  text?: string;
+};
+
 type SignalMessage = {
   epoch?: number;
   fromSlotId?: string;
@@ -557,6 +571,46 @@ function v2WriteResumeToken(roomId: string, token: string | null): void {
   }
 }
 
+function mailboxSecretKey(roomId: string, slotId: string): string {
+  return `zestsend:room:${encodeURIComponent(roomId)}:${encodeURIComponent(slotId)}:mailbox`;
+}
+
+type StoredMailboxSecret = {
+  key: string;
+  privateKey: string;
+  publicKey: string;
+  trustedRemotePublicKey?: string;
+};
+
+function readMailboxSecret(roomId: string, slotId: string | null): StoredMailboxSecret | null {
+  if (!slotId) return null;
+  try {
+    const raw = window.sessionStorage.getItem(mailboxSecretKey(roomId, slotId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredMailboxSecret>;
+    if (typeof parsed.key !== "string" || typeof parsed.privateKey !== "string" || typeof parsed.publicKey !== "string") return null;
+    return {
+      key: parsed.key,
+      privateKey: parsed.privateKey,
+      publicKey: parsed.publicKey,
+      ...(typeof parsed.trustedRemotePublicKey === "string" ? { trustedRemotePublicKey: parsed.trustedRemotePublicKey } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeMailboxSecret(roomId: string, slotId: string | null, secret: StoredMailboxSecret | null): void {
+  if (!slotId) return;
+  try {
+    const key = mailboxSecretKey(roomId, slotId);
+    if (secret) window.sessionStorage.setItem(key, JSON.stringify(secret));
+    else window.sessionStorage.removeItem(key);
+  } catch {
+    // sessionStorage is optional in private browsing contexts.
+  }
+}
+
 function v2Epoch(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
@@ -632,6 +686,20 @@ export class NativeWebRTCSession {
   private receivedChatIds = new Set<string>();
   private fileTransferManager: FileTransferManager | null = null;
   private mediaTransport: MediaTransport;
+
+  /** Mailbox state (Option C) */
+  private mailboxKey: string | null = null; // base64url encoded 256-bit key
+  private mailboxSigningKeyPair: CryptoKeyPair | null = null;
+  private remoteMailboxPubKey: CryptoKey | null = null;
+  private trustedRemotePublicKey: string | null = null;
+  private mailboxInitialized = false;
+  private identityChanged = false;
+  private mailboxReady: Promise<void> | null = null;
+
+  /** Getter for slotId to allow external access for persistence */
+  getSlotId(): string | null {
+    return this.slotId;
+  }
 
   constructor(
     private readonly roomId: string,
@@ -1040,6 +1108,7 @@ export class NativeWebRTCSession {
         signalingState: "connected",
         state: "connected",
       });
+      void this.ensureMailboxMaterial();
       if (!this.initiator && !this.peer) this.setStep("p2p", { state: "pending", detail: "Waiting for connection offer" });
       // A full page refresh can resume the signaling lease without retaining
       // the old RTCPeerConnection. Ask the room to rotate the peer session so
@@ -1142,6 +1211,9 @@ export class NativeWebRTCSession {
       this.remoteSlotId = null;
       this.rememberedRemoteSlotId = null;
       this.remotePeerSessionId = null;
+      this.trustedRemotePublicKey = null;
+      this.identityChanged = false;
+      this.mailboxInitialized = false;
       this.stopDataChannelLatencyProbe(); this.closeDataChannels(); this.mediaTransport.detachPeer();
       this.peer?.close(); this.peer = null; this.peerRestarting = false; this.connectedNotified = false;
       this.reportStatus({ detail: "Waiting for another participant", p2pState: "waiting", remoteSeatState: this.remoteSeatState, state: "connected" });
@@ -1359,7 +1431,12 @@ export class NativeWebRTCSession {
         this.reportStatus({ detail: "Peer-to-peer connection established", p2pState: "connected", state: "connected" });
         this.onConnected(this);
       }
-      if (this.openDataChannelCount() === DATA_CHANNEL_COUNT) this.reportStatus({ p2pState: "connected", state: "connected" });
+      if (this.openDataChannelCount() === DATA_CHANNEL_COUNT) {
+        this.reportStatus({ p2pState: "connected", state: "connected" });
+        if (!this.mailboxInitialized && this.remoteSlotId) {
+          void this.initializeMailbox();
+        }
+      }
       if (this.peer) void this.detectConnectionRoute(this.peer);
     };
     channel.onmessage = (event) => {
@@ -1439,6 +1516,164 @@ export class NativeWebRTCSession {
       || this.peerLocalSlotId !== this.slotId
       || this.peerLocalSessionId !== this.peerSessionId) return;
     this.sendSocket({ type: "signal", epoch: this.epoch, fromSlotId: this.slotId ?? undefined, peerSessionId: this.peerSessionId ?? undefined, payload });
+  }
+
+  /** Persist or restore the mailbox key and signing key for this tab's seat. */
+  private async ensureMailboxMaterial(): Promise<void> {
+    if (this.mailboxReady) return this.mailboxReady;
+    this.mailboxReady = (async () => {
+      if (!this.slotId) return;
+      const stored = readMailboxSecret(this.roomId, this.slotId);
+      if (stored) {
+        this.mailboxKey = stored.key;
+        const privateKey = await this.importPrivateKey(stored.privateKey);
+        const publicKey = await this.importPublicKey(stored.publicKey);
+        this.mailboxSigningKeyPair = { privateKey, publicKey };
+        this.trustedRemotePublicKey = stored.trustedRemotePublicKey ?? null;
+        return;
+      }
+      this.mailboxKey = await this.generateMailboxKey();
+      this.mailboxSigningKeyPair = await this.generateSigningKeyPair();
+      writeMailboxSecret(this.roomId, this.slotId, {
+        key: this.mailboxKey,
+        privateKey: await this.exportPrivateKey(this.mailboxSigningKeyPair.privateKey),
+        publicKey: await this.exportPublicKey(this.mailboxSigningKeyPair.publicKey),
+        ...(this.trustedRemotePublicKey ? { trustedRemotePublicKey: this.trustedRemotePublicKey } : {}),
+      });
+    })().catch(() => {
+      this.mailboxReady = null;
+    });
+    return this.mailboxReady;
+  }
+
+  /** Share the mailbox key over the established data channel, then collect queued ciphertext. */
+  private async initializeMailbox(): Promise<void> {
+    if (!this.remoteSlotId || this.mailboxInitialized) return;
+    await this.ensureMailboxMaterial();
+    if (!this.mailboxKey || !this.mailboxSigningKeyPair) return;
+    const keyHash = await this.sha256(this.mailboxKey);
+    const publicKey = await this.exportPublicKey(this.mailboxSigningKeyPair.publicKey);
+    const sent = this.sendControlMessage({
+      type: "mailbox-key",
+      key: this.mailboxKey,
+      keyHash,
+      publicKey,
+      senderSlot: this.slotId,
+    });
+    if (!sent) return;
+    this.mailboxInitialized = true;
+    await this.pullMailboxMessages();
+    this.sendControlMessage({ type: "mailbox-ready" });
+  }
+
+  private async acceptMailboxKey(payload: Record<string, unknown>): Promise<void> {
+    const key = typeof payload.key === "string" ? payload.key : null;
+    const keyHash = typeof payload.keyHash === "string" ? payload.keyHash : null;
+    const publicKey = typeof payload.publicKey === "string" ? payload.publicKey : null;
+    const senderSlot = typeof payload.senderSlot === "string" ? payload.senderSlot : null;
+    if (!key || !keyHash || !publicKey || !senderSlot || senderSlot === this.slotId) return;
+    if (await this.sha256(key) !== keyHash) return;
+    if (this.trustedRemotePublicKey && this.trustedRemotePublicKey !== publicKey) {
+      this.identityChanged = true;
+      this.mailboxInitialized = false;
+      this.reportStatus({
+        detail: "The other participant's identity changed. Automatic history sync is paused.",
+        remoteSeatState: "present",
+        state: this.isP2PHealthy() ? "connected" : "reconnecting",
+      });
+      return;
+    }
+    this.trustedRemotePublicKey = publicKey;
+    this.identityChanged = false;
+    await this.ensureMailboxMaterial();
+    this.mailboxKey = key;
+    this.remoteSlotId = senderSlot;
+    this.remoteMailboxPubKey = await this.importPublicKey(publicKey);
+    if (this.slotId && this.mailboxSigningKeyPair) {
+      writeMailboxSecret(this.roomId, this.slotId, {
+        key,
+        privateKey: await this.exportPrivateKey(this.mailboxSigningKeyPair.privateKey),
+        publicKey: await this.exportPublicKey(this.mailboxSigningKeyPair.publicKey),
+        trustedRemotePublicKey: publicKey,
+      });
+    }
+    this.mailboxInitialized = true;
+    await this.pullMailboxMessages();
+  }
+
+  /** Mailbox: push message to DO (for offline delivery) */
+  async pushMailboxMessage(message: { id: string; text?: string; type: MailboxMessage["type"] }): Promise<void> {
+    await this.ensureMailboxMaterial();
+    if (this.identityChanged || !this.mailboxKey || !this.mailboxSigningKeyPair || !this.remoteSlotId || !this.slotId) return;
+
+    try {
+      const mailboxKey = await this.importMailboxKey(this.mailboxKey);
+      const plaintext = JSON.stringify({ ...message, fromSlot: this.slotId });
+      const { ciphertext, nonce } = await this.encryptMailbox(mailboxKey, plaintext);
+      
+      // Sign the message for sender authentication
+      const signInput = `${ciphertext}:${nonce}:${Date.now()}`;
+      const signature = await this.signMessage(this.mailboxSigningKeyPair.privateKey, signInput);
+      const senderPubKey = await this.exportPublicKey(this.mailboxSigningKeyPair.publicKey);
+      
+      const fullMessage: MailboxMessage = {
+        ...message,
+        fromSlot: this.slotId!,
+        toSlot: this.remoteSlotId,
+        ciphertext,
+        nonce,
+        senderPubKey,
+        signature,
+        timestamp: Date.now(),
+      };
+      
+      await fetch(`/api/rooms/${this.roomId}/mailbox/push`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(fullMessage),
+      });
+    } catch {
+      // Ignore push failures
+    }
+  }
+
+  /** Mailbox: pull and decrypt messages from DO */
+  async pullMailboxMessages(): Promise<void> {
+    await this.ensureMailboxMaterial();
+    if (this.identityChanged || !this.mailboxKey || !this.slotId) return;
+
+    try {
+      const response = await fetch(`/api/rooms/${this.roomId}/mailbox/pull`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slotId: this.slotId }),
+      });
+      if (!response.ok) return;
+      const messages = await response.json() as MailboxMessage[];
+      
+      const mailboxKey = await this.importMailboxKey(this.mailboxKey);
+      
+      for (const msg of messages) {
+        // Verify signature
+        const senderPubKey = await this.importPublicKey(msg.senderPubKey);
+        const signInput = `${msg.ciphertext}:${msg.nonce}:${msg.timestamp}`;
+        const valid = await this.verifyMessage(senderPubKey, signInput, msg.signature);
+        if (!valid) continue;
+        
+        // Decrypt
+        const plaintext = await this.decryptMailbox(mailboxKey, msg.ciphertext, msg.nonce);
+        const content = JSON.parse(plaintext);
+        
+        // Deliver based on type
+        if (content.type === "chat") {
+          this.onInteractiveMessage({ id: content.id, text: content.text, type: "chat" });
+        } else if (content.type === "file-offer") {
+          // File offers are handled via the file transfer manager's existing offer flow
+        }
+      }
+    } catch {
+      // Ignore pull failures
+    }
   }
 
   private startHeartbeat(generation: number, protocol: SignalingHeartbeatProtocol): void {
@@ -1535,8 +1770,18 @@ export class NativeWebRTCSession {
 
   private handleDataChannelMessage(data: unknown): void {
     if (typeof data !== "string") return;
-    let message: DataChannelControlMessage;
-    try { message = JSON.parse(data) as DataChannelControlMessage; } catch { return; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(data) as unknown; } catch { return; }
+    if (parsed && typeof parsed === "object" && (parsed as { type?: unknown }).type === "mailbox-key") {
+      void this.acceptMailboxKey(parsed as Record<string, unknown>);
+      return;
+    }
+    if (parsed && typeof parsed === "object" && (parsed as { type?: unknown }).type === "mailbox-ready") {
+      this.mailboxInitialized = true;
+      void this.pullMailboxMessages();
+      return;
+    }
+    const message = parsed as DataChannelControlMessage;
     this.fileTransferManager?.handleControl(message as unknown as { type: string; [key: string]: unknown });
     if (this.mediaTransport.handleControlMessage(message)) return;
 
@@ -1599,6 +1844,105 @@ export class NativeWebRTCSession {
   private dataTransfer(): { received: number; sent: number } {
     const traffic = this.mediaTransport.traffic; return { received: this.receivedBytes + traffic.received, sent: this.sentBytes + traffic.sent };
   }
+
+  /** Mailbox encryption helpers (Option C) */
+
+  private async generateSigningKeyPair(): Promise<CryptoKeyPair> {
+    return crypto.subtle.generateKey(
+      { name: "Ed25519" },
+      true, // extractable
+      ["sign", "verify"]
+    );
+  }
+
+  private toBuffer(bytes: Uint8Array): ArrayBuffer {
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    return copy.buffer;
+  }
+
+  private async exportPublicKey(key: CryptoKey): Promise<string> {
+    const raw = await crypto.subtle.exportKey("raw", key);
+    return this.toBase64Url(new Uint8Array(raw));
+  }
+
+  private async importPublicKey(raw: string): Promise<CryptoKey> {
+    const binary = this.toBuffer(this.fromBase64Url(raw));
+    return crypto.subtle.importKey("raw", binary, { name: "Ed25519" }, true, ["verify"]);
+  }
+
+  private async exportPrivateKey(key: CryptoKey): Promise<string> {
+    const raw = await crypto.subtle.exportKey("pkcs8", key);
+    return this.toBase64Url(new Uint8Array(raw));
+  }
+
+  private async importPrivateKey(raw: string): Promise<CryptoKey> {
+    const binary = this.toBuffer(this.fromBase64Url(raw));
+    return crypto.subtle.importKey("pkcs8", binary, { name: "Ed25519" }, true, ["sign"]);
+  }
+
+  private async generateMailboxKey(): Promise<string> {
+    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+    const raw = await crypto.subtle.exportKey("raw", key);
+    return this.toBase64Url(new Uint8Array(raw));
+  }
+
+  private async importMailboxKey(raw: string): Promise<CryptoKey> {
+    const binary = this.toBuffer(this.fromBase64Url(raw));
+    return crypto.subtle.importKey("raw", binary, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]);
+  }
+
+  private toBase64Url(bytes: Uint8Array): string {
+    return btoa(String.fromCharCode(...bytes))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+  }
+
+  private fromBase64Url(str: string): Uint8Array {
+    const pad = str.length % 4;
+    const base64 = str.replace(/-/g, "+").replace(/_/g, "/") + (pad === 2 ? "==" : pad === 3 ? "=" : "");
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  private async sha256(data: string | Uint8Array): Promise<string> {
+    const bytes = typeof data === "string" ? this.fromBase64Url(data) : data;
+    const digest = await crypto.subtle.digest("SHA-256", this.toBuffer(bytes));
+    return this.toBase64Url(new Uint8Array(digest));
+  }
+
+  private async encryptMailbox(key: CryptoKey, plaintext: string): Promise<{ ciphertext: string; nonce: string }> {
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = new TextEncoder().encode(plaintext);
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, encoded);
+    return {
+      ciphertext: this.toBase64Url(new Uint8Array(ciphertext)),
+      nonce: this.toBase64Url(nonce),
+    };
+  }
+
+  private async decryptMailbox(key: CryptoKey, ciphertext: string, nonce: string): Promise<string> {
+    const ciphertextBytes = this.toBuffer(this.fromBase64Url(ciphertext));
+    const nonceBytes = this.fromBase64Url(nonce);
+    const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: this.toBuffer(nonceBytes) }, key, ciphertextBytes);
+    return new TextDecoder().decode(plaintext);
+  }
+
+  private async signMessage(signingKey: CryptoKey, message: string): Promise<string> {
+    const encoded = new TextEncoder().encode(message);
+    const signature = await crypto.subtle.sign({ name: "Ed25519" }, signingKey, encoded);
+    return this.toBase64Url(new Uint8Array(signature));
+  }
+
+  private async verifyMessage(publicKey: CryptoKey, message: string, signature: string): Promise<boolean> {
+    const encoded = new TextEncoder().encode(message);
+    const signatureBytes = this.toBuffer(this.fromBase64Url(signature));
+    return crypto.subtle.verify({ name: "Ed25519" }, publicKey, signatureBytes, encoded);
+  }
+
   private closeDataChannels(): void {
     const collaborationWasReady = this.collaborationReady;
     for (const name of DATA_CHANNEL_NAMES) {

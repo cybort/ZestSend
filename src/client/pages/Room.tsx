@@ -90,6 +90,17 @@ import {
   type SessionStatus,
   type WebRTCTransportDiagnostics,
 } from "../lib/webrtc";
+import {
+  persistChatMessages,
+  restoreChatMessages,
+  persistFileTransfers,
+  restoreFileTransfers,
+  persistCollaborationMeta,
+  restoreCollaborationMeta,
+  persistSlotId,
+  restoreSlotId,
+  clearRoomStorage,
+} from "../lib/room-persistence";
 
 type StatusRowProps = {
   icon: typeof RiRouterLine;
@@ -2903,6 +2914,33 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     refreshCanvasContent();
     return () => strokes.unobserveDeep(refreshCanvasContent);
   }, [collaborationProvider]);
+
+  // Persist chat messages, file transfers, and collab meta to sessionStorage
+  useEffect(() => {
+    if (chatMessages.length > 0) {
+      const session = sessionRef.current;
+      if (session?.getSlotId()) {
+        persistChatMessages(roomId, session.getSlotId(), chatMessages);
+      }
+    }
+  }, [chatMessages, roomId]);
+
+  useEffect(() => {
+    if (fileTransfers.length > 0) {
+      const session = sessionRef.current;
+      if (session?.getSlotId()) {
+        persistFileTransfers(roomId, session.getSlotId(), fileTransfers);
+      }
+    }
+  }, [fileTransfers, roomId]);
+
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (session?.getSlotId()) {
+      persistCollaborationMeta(roomId, session.getSlotId(), { hasCanvasContent: canvasHasContent });
+    }
+  }, [canvasHasContent, roomId]);
+
   const [progress, setProgress] = useState<ConnectionProgress>({
     websocket: { state: "pending", detail: "Waiting for signaling socket" },
     resource: { state: "pending", detail: "Waiting to request Cloudflare resources" },
@@ -3315,8 +3353,9 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     if (peerTypingTimerRef.current !== null) window.clearTimeout(peerTypingTimerRef.current);
     peerTypingTimerRef.current = null;
     setPeerTyping(false);
-    chatMessagesRef.current = [];
-    setChatMessages([]);
+    // Don't clear persisted chat messages on peer reset — they survive session resets
+    // chatMessagesRef.current = [];
+    // setChatMessages([]);
     if (fileTransferRefreshTimerRef.current !== null) window.clearTimeout(fileTransferRefreshTimerRef.current);
     fileTransferRefreshTimerRef.current = null;
     fileTransfersRef.current = [];
@@ -3364,6 +3403,31 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       roomId,
       setProgress,
       () => {
+        // Restore persisted state on successful connection
+        const storedSlotId = restoreSlotId(roomId);
+        const currentSlotId = session.getSlotId();
+        if (storedSlotId && currentSlotId === storedSlotId) {
+          // Restore chat messages
+          const storedChat = restoreChatMessages(roomId, currentSlotId);
+          if (storedChat.length > 0) {
+            chatMessagesRef.current = storedChat;
+            setChatMessages(storedChat);
+          }
+          // Restore file transfers metadata
+          const storedTransfers = restoreFileTransfers(roomId, currentSlotId);
+          if (storedTransfers.length > 0) {
+            fileTransfersRef.current = storedTransfers;
+            setFileTransfers(storedTransfers);
+          }
+          // Restore canvas flag
+          const collabMeta = restoreCollaborationMeta(roomId, currentSlotId);
+          setCanvasHasContent(collabMeta.hasCanvasContent);
+        }
+        // Persist current slotId for future refreshes
+        if (currentSlotId) {
+          persistSlotId(roomId, currentSlotId);
+        }
+
         const pendingMessages = chatMessagesRef.current.filter((message) => message.sender === "local" && message.deliveryStatus !== "read" && message.deliveryStatus !== "received");
         const retriedMessageIds = new Set<string>();
         for (const message of pendingMessages) {
@@ -3375,6 +3439,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
             : message));
         }
         fileManagerRef.current?.onTransportReady();
+        void session.pullMailboxMessages();
         if (!connectionReportedRef.current) {
           connectionReportedRef.current = true;
           trackInsightEvent("p2p_session_connected", { locale });
@@ -3527,7 +3592,11 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
 
   const leave = () => {
     disposePeerSessionScope();
-    sessionRef.current?.close();
+    // Clear room-scoped storage on explicit leave
+    const session = sessionRef.current;
+    if (session?.getSlotId()) {
+      clearRoomStorage(roomId, session.getSlotId());
+    }    sessionRef.current?.close();
     chatMessagesRef.current = [];
     setChatMessages([]);
     void fileManagerRef.current?.dispose();
@@ -3586,7 +3655,9 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   const sendChatMessage = (text: string): boolean => {
     const message = text.trim();
     const id = cuid();
-    if (!sessionRef.current?.sendChatMessage(id, message)) return false;
+    const delivered = sessionRef.current?.sendChatMessage(id, message) ?? false;
+    if (!delivered) void sessionRef.current?.pushMailboxMessage({ id, text: message, type: "chat" });
+    if (!delivered && !sessionRef.current) return false;
     updateChatMessages((current) => appendChatMessage(current, {
       deliveryStatus: "sending",
       id,

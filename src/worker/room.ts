@@ -8,6 +8,12 @@ import {
   type SignalingHeartbeatProtocol,
 } from "../shared/signaling-protocol";
 
+/** Offline encrypted mailbox constants (Option C) */
+const MAILBOX_MAX_MESSAGES = 1000;
+const MAILBOX_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAILBOX_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAILBOX_STORAGE_KEY = "mailbox";
+
 type SignalPayload = {
   candidate?: {
     candidate: string;
@@ -41,6 +47,8 @@ type SlotState = {
   disconnectedAt: number | null;
   leaseExpiresAt: number | null;
   lastSeenAt?: number;
+  /** Mailbox key hash (SHA-256 of the 256-bit key K) for this slot */
+  mailboxKeyHash?: string;
 };
 
 type RoomState = {
@@ -53,6 +61,28 @@ type RoomState = {
 type InactiveConnection = {
   connectionId: string;
   slot: SlotState;
+};
+
+/** Encrypted mailbox message stored in DO */
+type MailboxMessage = {
+  /** Unique message ID */
+  id: string;
+  /** Sender slot ID */
+  fromSlot: string;
+  /** Recipient slot ID */
+  toSlot: string;
+  /** AES-256-GCM ciphertext (includes auth tag) */
+  ciphertext: string; // base64url encoded
+  /** Nonce (12 bytes) */
+  nonce: string; // base64url encoded
+  /** Sender's Ed25519 public key (for verification) */
+  senderPubKey: string; // base64url encoded
+  /** Signature over ciphertext + nonce + timestamp */
+  signature: string; // base64url encoded
+  /** Message timestamp (sender local time) */
+  timestamp: number;
+  /** Message type */
+  type: "chat" | "file-offer" | "control";
 };
 
 type ParsedMessage = {
@@ -72,6 +102,19 @@ const MAX_MESSAGE_BYTES = 128 * 1024;
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const STORAGE_KEY = "room-state-v2";
 const textEncoder = new TextEncoder();
+
+function isMailboxMessage(value: unknown): value is MailboxMessage {
+  if (!isRecord(value)) return false;
+  return typeof value.id === "string" && value.id.length > 0 && value.id.length <= 128
+    && typeof value.fromSlot === "string" && value.fromSlot.length <= 128
+    && typeof value.toSlot === "string" && value.toSlot.length <= 128
+    && typeof value.ciphertext === "string" && value.ciphertext.length > 0 && value.ciphertext.length <= 64_000
+    && typeof value.nonce === "string" && value.nonce.length <= 64
+    && typeof value.senderPubKey === "string" && value.senderPubKey.length <= 512
+    && typeof value.signature === "string" && value.signature.length <= 512
+    && typeof value.timestamp === "number" && Number.isFinite(value.timestamp)
+    && (value.type === "chat" || value.type === "file-offer" || value.type === "control");
+}
 
 function emptyState(): RoomState {
   return { version: 2, epoch: 0, offererSlotId: null, slots: [] };
@@ -187,6 +230,9 @@ export class Room extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/mailbox/push") return this.httpPushMailbox(request);
+    if (request.method === "POST" && url.pathname === "/mailbox/pull") return this.httpPullMailbox(request);
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected a WebSocket upgrade.", { status: 426 });
     }
@@ -833,6 +879,64 @@ export class Room extends DurableObject<Env> {
     } catch {
       // Ignore already-closed sockets.
     }
+  }
+
+  /** Mailbox operations (Option C). The room stores ciphertext only; authenticity is verified by clients. */
+
+  private async httpPushMailbox(request: Request): Promise<Response> {
+    const body = await request.json().catch(() => null) as Partial<MailboxMessage> | null;
+    if (!isMailboxMessage(body)) return Response.json({ message: "Invalid mailbox message." }, { status: 400 });
+    const stored = await this.storeMailboxMessage(body);
+    return Response.json({ stored }, { status: stored ? 200 : 409 });
+  }
+
+  private async httpPullMailbox(request: Request): Promise<Response> {
+    const body = await request.json().catch(() => null) as { slotId?: unknown } | null;
+    const slotId = typeof body?.slotId === "string" ? body.slotId : null;
+    if (!slotId) return Response.json({ message: "Missing slot id." }, { status: 400 });
+    const messages = await this.takeMailboxMessages(slotId);
+    return Response.json(messages);
+  }
+
+  private async storeMailboxMessage(message: MailboxMessage): Promise<boolean> {
+    let stored = false;
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const { state } = await this.loadStateAndNotify();
+      const sender = state.slots.find((slot) => slot.slotId === message.fromSlot);
+      if (!sender) return;
+
+      const mailbox = await this.ctx.storage.get<MailboxMessage[]>(MAILBOX_STORAGE_KEY) ?? [];
+      const live = mailbox.filter((item) => item.timestamp + MAILBOX_TTL_MS > Date.now());
+      let totalBytes = live.reduce((sum, item) => sum + item.ciphertext.length, 0);
+      if (live.length >= MAILBOX_MAX_MESSAGES || totalBytes + message.ciphertext.length > MAILBOX_MAX_BYTES) {
+        live.sort((left, right) => left.timestamp - right.timestamp);
+        while (live.length >= MAILBOX_MAX_MESSAGES || totalBytes + message.ciphertext.length > MAILBOX_MAX_BYTES) {
+          const removed = live.shift();
+          if (removed) totalBytes -= removed.ciphertext.length;
+        }
+      }
+      live.push(message);
+      await this.ctx.storage.put(MAILBOX_STORAGE_KEY, live);
+      stored = true;
+    });
+    return stored;
+  }
+
+  private async takeMailboxMessages(slotId: string): Promise<MailboxMessage[]> {
+    let delivered: MailboxMessage[] = [];
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const mailbox = await this.ctx.storage.get<MailboxMessage[]>(MAILBOX_STORAGE_KEY) ?? [];
+      const now = Date.now();
+      delivered = mailbox.filter((item) => item.toSlot === slotId && item.timestamp + MAILBOX_TTL_MS > now);
+      const remaining = mailbox.filter((item) => item.toSlot !== slotId && item.timestamp + MAILBOX_TTL_MS > now);
+      if (remaining.length !== mailbox.length) await this.ctx.storage.put(MAILBOX_STORAGE_KEY, remaining);
+    });
+    return delivered;
+  }
+
+  /** Clean up mailbox when room becomes empty */
+  async clearMailbox(): Promise<void> {
+    await this.ctx.storage.delete(MAILBOX_STORAGE_KEY);
   }
 
 }

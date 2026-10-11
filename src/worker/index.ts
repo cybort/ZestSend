@@ -120,6 +120,43 @@ app.get("/api/rooms/:roomId/ws", async (context) => {
   return roomFor(context.env, roomId).fetch(context.req.raw);
 });
 
+function mailboxRoomResponse(context: { env: ApiBindings; req: { param: (name: string) => string } }): Response | null {
+  const roomId = context.req.param("roomId");
+  if (!roomIsValid(roomId)) return Response.json({ message: "Invalid room ID." }, { status: 400 });
+  return null;
+}
+
+/** Accept mailbox ciphertext from an admitted participant. The Durable Object stores only ciphertext. */
+app.post("/api/rooms/:roomId/mailbox/push", async (context) => {
+  const invalid = mailboxRoomResponse(context);
+  if (invalid) return invalid;
+  const roomId = context.req.param("roomId");
+  const body = await context.req.json().catch(() => null);
+  if (!body || typeof body !== "object") return context.json({ message: "Invalid mailbox payload." }, 400);
+  const stub = roomFor(context.env, roomId);
+  const result = await stub.fetch(new Request("https://room.internal/mailbox/push", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }));
+  return result;
+});
+
+/** Pull mailbox ciphertext addressed to the caller. Decryption happens only in the browser. */
+app.post("/api/rooms/:roomId/mailbox/pull", async (context) => {
+  const invalid = mailboxRoomResponse(context);
+  if (invalid) return invalid;
+  const roomId = context.req.param("roomId");
+  const body = await context.req.json().catch(() => ({}));
+  const stub = roomFor(context.env, roomId);
+  const result = await stub.fetch(new Request("https://room.internal/mailbox/pull", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }));
+  return result;
+});
+
 app.post("/api/turn/credentials", async (context) => {
   if (!context.env.TURN_ID || !context.env.TURN_TOKEN) {
     return context.json(
