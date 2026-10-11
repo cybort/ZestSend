@@ -695,6 +695,7 @@ export class NativeWebRTCSession {
   private mailboxKey: string | null = null; // base64url encoded 256-bit key
   private mailboxSigningKeyPair: CryptoKeyPair | null = null;
   private remoteMailboxPubKey: CryptoKey | null = null;
+  private mailboxTargetSlotId: string | null = null;
   private trustedRemotePublicKey: string | null = null;
   private mailboxInitialized = false;
   private identityChanged = false;
@@ -1310,6 +1311,7 @@ export class NativeWebRTCSession {
     );
     this.remoteSlotId = slotId;
     this.rememberedRemoteSlotId = slotId;
+    this.mailboxTargetSlotId = slotId;
     this.remotePeerSessionId = peerSessionId ?? this.remotePeerSessionId;
     if (replaced) {
       this.onPeerReplaced();
@@ -1327,7 +1329,7 @@ export class NativeWebRTCSession {
     if (signal.fromSlotId && this.remoteSlotId && signal.fromSlotId !== this.remoteSlotId) return false;
     if (signal.peerSessionId && this.remotePeerSessionId && signal.peerSessionId !== this.remotePeerSessionId) return false;
     if (epoch !== undefined && this.epoch === 0) this.epoch = epoch;
-    if (signal.fromSlotId) this.remoteSlotId = signal.fromSlotId;
+    if (signal.fromSlotId) { this.remoteSlotId = signal.fromSlotId; this.mailboxTargetSlotId = signal.fromSlotId; }
     if (signal.peerSessionId) this.remotePeerSessionId = signal.peerSessionId;
     return true;
   }
@@ -1630,6 +1632,7 @@ export class NativeWebRTCSession {
     await this.ensureMailboxMaterial();
     this.mailboxKey = key;
     this.remoteSlotId = senderSlot;
+    this.mailboxTargetSlotId = senderSlot;
     this.remoteMailboxPubKey = await this.importPublicKey(publicKey);
     if (this.slotId && this.mailboxSigningKeyPair) {
       writeMailboxSecret(this.roomId, this.slotId, {
@@ -1646,7 +1649,10 @@ export class NativeWebRTCSession {
   /** Mailbox: push message to DO (for offline delivery) */
   async pushMailboxMessage(message: { id: string; text?: string; type: MailboxMessage["type"] }): Promise<void> {
     await this.ensureMailboxMaterial();
-    if (this.identityChanged || !this.mailboxKey || !this.mailboxSigningKeyPair || !this.remoteSlotId || !this.slotId) return;
+    // Fall back to the last known remote seat so queued edits keep a delivery
+    // target while the peer is offline (peer-disconnected / peer-left races).
+    const target = this.remoteSlotId ?? this.mailboxTargetSlotId;
+    if (this.identityChanged || !this.mailboxKey || !this.mailboxSigningKeyPair || !target || !this.slotId) return;
 
     try {
       const mailboxKey = await this.importMailboxKey(this.mailboxKey);
@@ -1661,7 +1667,7 @@ export class NativeWebRTCSession {
       const fullMessage: MailboxMessage = {
         ...message,
         fromSlot: this.slotId!,
-        toSlot: this.remoteSlotId,
+        toSlot: target,
         ciphertext,
         nonce,
         senderPubKey,
@@ -1708,6 +1714,10 @@ export class NativeWebRTCSession {
         
         // Deliver based on type
         if (content.type === "chat") {
+          // The reconnect resend path can deliver the same id directly;
+          // deduplicate across mailbox pull and data-channel delivery.
+          if (typeof content.id !== "string" || this.receivedChatIds.has(content.id)) continue;
+          this.receivedChatIds.add(content.id);
           this.onInteractiveMessage({ id: content.id, text: content.text, type: "chat" });
         } else if (content.type === "file-offer") {
           // File offers are handled via the file transfer manager's existing offer flow

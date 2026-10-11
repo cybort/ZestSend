@@ -179,6 +179,8 @@ function WorkspaceEmptyState({ icon, message }: { icon: ReactNode; message: stri
 }
 
 function appendChatMessage(messages: ChatMessage[], message: ChatMessage): ChatMessage[] {
+  // Same id may arrive via the mailbox and the reconnect resend path.
+  if (messages.some((existing) => existing.id === message.id)) return messages;
   return [...messages, message].sort((left, right) => left.id.localeCompare(right.id));
 }
 
@@ -221,6 +223,11 @@ const roomCopy = {
     roomFullDescription: "This room already has two participants. Try a different six-digit room number.",
     roomFullTitle: "Room is full",
     returnHome: "Return home",
+    toastPeerOffline: "Waiting for the other participant to reconnect. You can keep editing.",
+    toastPeerNew: "Connecting to the new participant. You can keep editing.",
+    toastReserved: "Room temporarily unavailable; retrying automatically.",
+    toastSignaling: "Reconnecting the signaling channel.",
+    toastRestored: "Reconnected",
     pageTitle: (roomId: string) => `Connecting to room ${roomId}`,
     roomTitle: (roomId: string) => `ZestSend room ${roomId}`,
   },
@@ -245,6 +252,11 @@ const roomCopy = {
     roomFullDescription: "这个房间已有两位参与者，请换一个六位房间号后重试。",
     roomFullTitle: "房间已满",
     returnHome: "返回首页",
+    toastPeerOffline: "对方已离线，等待对方重新连接。你可以继续编辑。",
+    toastPeerNew: "正在与新参与者建立连接。你可以继续编辑。",
+    toastReserved: "房间暂时不可用，正在自动重试。",
+    toastSignaling: "信令连接正在重连。",
+    toastRestored: "已重新连接",
     pageTitle: (roomId: string) => `正在连接房间 ${roomId}`,
     roomTitle: (roomId: string) => `ZestSend 房间 ${roomId}`,
   },
@@ -2629,7 +2641,10 @@ function RoomWorkspace({
                         onTyping={onChatTyping}
                         peerTyping={peerTyping}
                         placeholder={workspace.chatPlaceholder}
-                        ready={progress.dataChannel.state === "active"}
+                        // Chat stays editable while the peer is offline: sends
+                        // queue locally and in the encrypted mailbox instead of
+                        // being blocked with the composer.
+                        ready
                         typingLabel={workspace.typing}
                       />
                     ) : activeWorkspace === "files" ? (
@@ -2832,6 +2847,42 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   const [dialogPhase, setDialogPhase] = useState<"connecting" | "closing-for-full" | "closing-for-leave" | "closing-for-ready" | "closing-for-reconnect" | "full" | "ready">("connecting");
   const [error, setError] = useState<string | null>(null);
   const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
+  const [reconnectToast, setReconnectToast] = useState<{ kind: "reconnecting" | "restored"; text: string } | null>(null);
+  const reconnectToastKindRef = useRef<"reconnecting" | "restored" | null>(null);
+  const reconnectToastTimerRef = useRef<number | null>(null);
+  const workspaceActiveRef = useRef(false);
+
+  useEffect(() => {
+    workspaceActiveRef.current = dialogPhase === "ready";
+  }, [dialogPhase]);
+
+  const updateReconnectToast = (value: { kind: "reconnecting" | "restored"; text: string } | null) => {
+    reconnectToastKindRef.current = value?.kind ?? null;
+    setReconnectToast(value);
+  };
+
+  const notifyReconnecting = (kind: "peer-offline" | "peer-new" | "reserved" | "signaling") => {
+    if (reconnectToastTimerRef.current !== null) {
+      window.clearTimeout(reconnectToastTimerRef.current);
+      reconnectToastTimerRef.current = null;
+    }
+    const copy = roomCopy[locale];
+    const text = kind === "peer-offline" ? copy.toastPeerOffline
+      : kind === "peer-new" ? copy.toastPeerNew
+      : kind === "reserved" ? copy.toastReserved
+      : copy.toastSignaling;
+    updateReconnectToast({ kind: "reconnecting", text });
+  };
+
+  const notifyRestored = () => {
+    if (reconnectToastKindRef.current !== "reconnecting") return;
+    updateReconnectToast({ kind: "restored", text: roomCopy[locale].toastRestored });
+    if (reconnectToastTimerRef.current !== null) window.clearTimeout(reconnectToastTimerRef.current);
+    reconnectToastTimerRef.current = window.setTimeout(() => {
+      reconnectToastTimerRef.current = null;
+      updateReconnectToast(null);
+    }, 3_000);
+  };
   const [connectionRoute, setConnectionRoute] = useState<ConnectionRoute>("direct");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [fileTransfers, setFileTransfers] = useState<FileTransferSnapshot[]>([]);
@@ -3330,6 +3381,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
 
   useEffect(() => () => {
     if (reconnectDialogTimerRef.current !== null) window.clearTimeout(reconnectDialogTimerRef.current);
+    if (reconnectToastTimerRef.current !== null) window.clearTimeout(reconnectToastTimerRef.current);
   }, []);
 
   const resumeRemoteAudio = () => {
@@ -3420,7 +3472,13 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
 
   useEffect(() => {
     renewPeerSessionScope();
-    const showReconnectDialog = (detail = "Reconnecting signaling socket") => {
+    const showReconnectDialog = (kind: "peer-offline" | "peer-new" | "reserved" | "signaling", detail = "Reconnecting signaling socket") => {
+      // Once the workspace is active, never cover the room with the full-screen
+      // connection dialog: keep editing available and surface a corner toast.
+      if (workspaceActiveRef.current) {
+        notifyReconnecting(kind);
+        return;
+      }
       setError(detail);
       setDialogPhase((current) => current === "ready" ? "closing-for-reconnect" : current === "closing-for-reconnect" ? current : "connecting");
       if (reconnectDialogTimerRef.current !== null) window.clearTimeout(reconnectDialogTimerRef.current);
@@ -3475,7 +3533,10 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           trackInsightEvent("p2p_session_connected", { locale });
         }
         setError(null);
-        setDialogPhase("closing-for-ready");
+        // Only walk through the closing transition when the full-screen dialog
+        // is actually on screen; a reconnect while the workspace is already
+        // ready must stay put (corner toast handles the status).
+        setDialogPhase((current) => current === "connecting" || current === "closing-for-reconnect" ? "closing-for-ready" : current);
       },
       setError,
       () => {
@@ -3483,7 +3544,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
         setDialogPhase("closing-for-full");
       },
       () => {
-        if (resetParticipantResources(session)) showReconnectDialog("Waiting for the other participant to reconnect");
+        if (resetParticipantResources(session)) showReconnectDialog("peer-offline", "Waiting for the other participant to reconnect");
       },
       setConnectionRoute,
       (message) => {
@@ -3514,6 +3575,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       },
       handleSharedPlaybackMessage,
       (status: SessionStatus) => {
+        if (status.state === "connected") notifyRestored();
         if (status.p2pState === "connected") {
           setError(null);
           if (status.signalingState === "reconnecting" || status.signalingState === "unavailable"
@@ -3539,13 +3601,18 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
         }
         setConnectionNotice(null);
         if (status.state === "reconnecting" || status.state === "reserved") {
-          showReconnectDialog(status.detail);
+          showReconnectDialog(
+            status.state === "reserved" ? "reserved"
+              : (status.detail ?? "").includes("Waiting for the other participant") || status.remoteSeatState === "grace" ? "peer-offline"
+              : "signaling",
+            status.detail,
+          );
           return;
         }
         if (status.state === "connected") setError(null);
       },
       () => {
-        if (resetParticipantResources(session)) showReconnectDialog("Connecting to the new participant");
+        if (resetParticipantResources(session)) showReconnectDialog("peer-new", "Connecting to the new participant");
       },
     );
     sessionRef.current = session;
@@ -3626,7 +3693,11 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     const session = sessionRef.current;
     if (session?.getSlotId()) {
       clearRoomStorage(roomId, session.getSlotId());
-    }    sessionRef.current?.close();
+    }
+    updateReconnectToast(null);
+    if (reconnectToastTimerRef.current !== null) window.clearTimeout(reconnectToastTimerRef.current);
+    reconnectToastTimerRef.current = null;
+    sessionRef.current?.close();
     chatMessagesRef.current = [];
     setChatMessages([]);
     void fileManagerRef.current?.dispose();
@@ -4177,6 +4248,30 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
         />
       )}
       </div>
+      <AnimatePresence initial={false}>
+        {reconnectToast ? (
+          <motion.div
+            animate={{ opacity: 1, y: 0 }}
+            className="pointer-events-none fixed right-4 top-4 z-[70] max-w-[min(22rem,calc(100vw-2rem))]"
+            exit={{ opacity: 0, y: -8 }}
+            initial={{ opacity: 0, y: -8 }}
+            key="reconnect-toast"
+            transition={{ duration: 0.2 }}
+          >
+            <div
+              aria-live="polite"
+              className={`rounded-xl border px-4 py-2.5 text-xs font-medium leading-relaxed tracking-[0.03em] shadow-lg backdrop-blur-md ${
+                reconnectToast.kind === "restored"
+                  ? "border-emerald-200/25 bg-emerald-300/10 text-emerald-100/90"
+                  : "border-amber-200/25 bg-amber-200/10 text-amber-100/90"
+              }`}
+              role="status"
+            >
+              {reconnectToast.text}
+            </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </Layout>
   );
 }
