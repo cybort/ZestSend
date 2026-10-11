@@ -6,14 +6,14 @@ export function cn(...inputs) {
   return twMerge(clsx(inputs));
 }
 
-// 生成4位随机数字
+// 生成6位随机数字
 export function generateRoomId() {
-  return Math.floor(1000 + Math.random() * 9000).toString();
+  return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
 // 检查输入的房间ID是否有效
 export function isValidRoomId(roomId) {
-  return /^\d{4}$/.test(roomId);
+  return /^\d{6}$/.test(roomId);
 }
 
 // 将字节数转换为可读格式

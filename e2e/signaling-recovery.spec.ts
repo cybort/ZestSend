@@ -114,7 +114,7 @@ async function createRoomPeer(page: Page, roomId: string, interceptSignaling = t
   let routeRegistered = false;
   const registerSignalingRoute = async () => {
     if (routeRegistered) return;
-    await page.routeWebSocket(/\/api\/rooms\/\d{4}\/ws(?:\?.*)?$/, (client) => {
+    await page.routeWebSocket(/\/api\/rooms\/\d{6}\/ws(?:\?.*)?$/, (client) => {
       if (blockNewSockets) {
         client.close({ code: 1001, reason: "Signaling is paused by the test." });
         return;
@@ -181,7 +181,7 @@ async function createPair(
 test.describe("signaling-only interruptions", () => {
   for (const durationMs of [5_000, 20_000]) {
     test(`preserves chat and the peer connection through a ${durationMs / 1_000}s signaling interruption`, async ({ browser }) => {
-      const roomId = String(Math.floor(1000 + Math.random() * 9000));
+      const roomId = String(Math.floor(100000 + Math.random() * 900000));
       const pair = await createPair(browser, roomId);
       try {
         const alicePeerCount = await peerCount(pair.alice);
@@ -210,7 +210,7 @@ test.describe("signaling-only interruptions", () => {
   }
 
   test("resumes the signaling seat after a full page refresh", async ({ browser }) => {
-    const roomId = String(Math.floor(1000 + Math.random() * 9000));
+    const roomId = String(Math.floor(100000 + Math.random() * 900000));
     const pair = await createPair(browser, roomId, { interceptSignaling: false });
     try {
       await sendChat(pair.bob, "chat-before-refresh");
@@ -240,7 +240,7 @@ test.describe("signaling-only interruptions", () => {
   });
 
   test("admits only two participants in the browser room", async ({ browser }) => {
-    const roomId = String(Math.floor(1000 + Math.random() * 9000));
+    const roomId = String(Math.floor(100000 + Math.random() * 900000));
     const firstContext = await browser.newContext();
     const secondContext = await browser.newContext();
     const thirdContext = await browser.newContext();
@@ -274,7 +274,7 @@ test.describe("signaling-only interruptions", () => {
   });
 
   test("restarts the peer after ICE failure and reconnects chat", async ({ browser }) => {
-    const roomId = String(Math.floor(1000 + Math.random() * 9000));
+    const roomId = String(Math.floor(100000 + Math.random() * 900000));
     const pair = await createPair(browser, roomId, { interceptSignaling: false });
     try {
       await sendChat(pair.alice, "chat-before-ice-failure");
@@ -304,7 +304,7 @@ test.describe("signaling-only interruptions", () => {
 
   test("keeps collaboration and voice active through a signaling outage", async ({ browser }) => {
     test.setTimeout(240_000);
-    const roomId = String(Math.floor(1000 + Math.random() * 9000));
+    const roomId = String(Math.floor(100000 + Math.random() * 900000));
     const pair = await createPair(browser, roomId, { grantMediaPermissions: true });
     try {
       await pair.alice.getByRole("button", { name: "Collaborate" }).click();
@@ -352,7 +352,7 @@ test.describe("signaling-only interruptions", () => {
 
   test("keeps a large file transfer intact across signaling reconnection", async ({ browser }) => {
     test.setTimeout(180_000);
-    const roomId = String(Math.floor(1000 + Math.random() * 9000));
+    const roomId = String(Math.floor(100000 + Math.random() * 900000));
     const pair = await createPair(browser, roomId);
     try {
       const payload = Buffer.alloc(32 * 1024 * 1024, 0x5a);
@@ -398,7 +398,7 @@ test.describe("signaling-only interruptions", () => {
 
   test("preserves a large file transfer and the existing peer after the seat lease expires", async ({ browser }) => {
     test.setTimeout(240_000);
-    const roomId = String(Math.floor(1000 + Math.random() * 9000));
+    const roomId = String(Math.floor(100000 + Math.random() * 900000));
     const pair = await createPair(browser, roomId);
     try {
       await pair.alice.getByRole("button", { name: "Files" }).click();

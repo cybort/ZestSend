@@ -72,7 +72,7 @@ const sockets = new Set<WebSocket>();
 async function openRoomSocket(roomId: string) {
   const id = env.ROOMS.idFromName(roomId);
   const stub = env.ROOMS.get(id);
-  const response = await stub.fetch("https://room.test/api/rooms/1234/ws", {
+  const response = await stub.fetch("https://room.test/api/rooms/123456/ws", {
     headers: { Upgrade: "websocket" },
   });
   const socket = response.webSocket;

@@ -78,7 +78,7 @@ app.get("/en", (context) => localizedResponse(context.req.raw, "en", context.env
 app.get("/zh", (context) => localizedResponse(context.req.raw, "zh", context.env.ASSETS));
 
 function roomIsValid(roomId: string | undefined): roomId is string {
-  return /^\d{4}$/.test(roomId ?? "");
+  return /^\d{6}$/.test(roomId ?? "");
 }
 
 function roomFor(env: ApiBindings, roomId: string) {

@@ -4,7 +4,7 @@ ZestSend 是一个开源的 WebRTC 点对点连接网页工具，可自行部署
 
 支持端对端加密的匿名实时聊天、文件互传、语音通话、视频通话、屏幕共享、同播共享、文本协作、画板等功能，支持点对点直连或 Cloudflare TURN 中转。
 
-无任何账号 / 数据记录机制、完全匿名，两位参与者输入相同的四位房间号后即可连接。直接使用 Cloudflare 部署，即可建立点对点直连连接。配置 Cloudflare TURN 服务器后，可每月免费获得 1000GB 中转连接流量。
+无任何账号 / 数据记录机制、完全匿名，两位参与者输入相同的六位房间号后即可连接。直接使用 Cloudflare 部署，即可建立点对点直连连接。配置 Cloudflare TURN 服务器后，可每月免费获得 1000GB 中转连接流量。
 
 延续并改进了 [RavelloH/TimePulse](https://github.com/RavelloH/TimePulse) 的玻璃态设计美学。
 

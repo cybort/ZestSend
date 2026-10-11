@@ -129,7 +129,7 @@ const homeCopy: Record<
     language: "en",
     prefix: "Anonymously",
     codeInputLabel: "Connection code digit",
-    codeHint: "Connect by entering any four digits that match someone else's.",
+    codeHint: "Connect by entering any six digits that match someone else's.",
     footerLinks: ["Language", "Settings", "About"],
     languageDialog: {
       close: "Close language picker",
@@ -184,7 +184,7 @@ const homeCopy: Record<
     language: "zh-CN",
     prefix: "匿名",
     codeInputLabel: "连接数字第",
-    codeHint: "与其他人输入任意四位相同数字来连接",
+    codeHint: "与其他人输入任意六位相同数字来连接",
     footerLinks: ["语言", "设置", "关于"],
     languageDialog: {
       close: "关闭语言选择",
@@ -401,14 +401,14 @@ function ConnectionCodeInput({
 
   return (
     <div className="mt-14 flex flex-col items-center sm:mt-20" role="group" aria-label={hint}>
-      <div className="flex items-center justify-center gap-3 sm:gap-5">
+      <div className="flex items-center justify-center gap-2 sm:gap-4">
         {Array.from({ length }, (_, index) => {
           const isFilled = Boolean(code[index]);
           const displayedDigit = code[index];
           const progressPosition = isFilled ? "0%" : "100%";
 
           return (
-            <div key={index} className="relative h-14 w-12 sm:h-20 sm:w-20">
+            <div key={index} className="relative h-14 w-10 sm:h-20 sm:w-16">
               <input
                 ref={(element) => {
                   inputRefs.current[index] = element;
@@ -983,7 +983,7 @@ export default function Home({ locale = "en" }: { locale?: HomeLocale }) {
             </>
           )}
           <ConnectionCodeInput
-            length={4}
+            length={6}
             hint={copy.codeHint}
             inputLabel={copy.codeInputLabel}
             links={copy.footerLinks}
