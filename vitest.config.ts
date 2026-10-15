@@ -9,6 +9,9 @@ export default defineConfig({
   ],
   test: {
     include: ["test/**/*.test.ts"],
+    // Daemon tests need real Node primitives (child_process); they run under
+    // vitest.harness.config.ts instead of the workerd pool.
+    exclude: ["test/harness-daemon.test.ts", "**/node_modules/**"],
     maxWorkers: 1,
     fileParallelism: false,
     isolate: false,

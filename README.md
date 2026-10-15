@@ -78,6 +78,39 @@ TURN_TOKEN=your_cloudflare_turn_api_token
 
 未配置 TURN 时，应用仍会使用公共 STUN 尝试直连；受限网络无法穿透时则不会启用中继。
 
+## 远程控制 AI 代理（harness）
+
+ZestSend 房间内新增「远程」面板：通过端对端数据通道，控制另一台设备上运行的 CLI AI 编码代理（Claude Code / Copilot CLI）——发送提示词、查看流式输出、批准/拒绝工具调用，并可选执行 shell 命令与文件读写。每个房间可管理多个代理会话，随时切换且互不打断。
+
+### 被控端守护进程
+
+```bash
+# 在运行 AI 代理的机器上启动（Node.js 22+）
+node node_modules/tsx/dist/cli.mjs src/harness/main.ts \
+  --room <六位房间号> \
+  --server https://<部署域名> \
+  --agent claude-code \        # 或 copilot-cli / fake（测试）
+  --workspace /path/to/repo \
+  --permission approve \       # readonly | approve | full
+  --state-dir ~/.zestsend/harness
+```
+
+守护进程会打印一次性**连接码**；在浏览器「远程」面板输入该码完成授权。`full` 权限才会开放 shell/文件写入，可配合 `--allow`/`--deny` 命令白名单。
+
+### 安全模型
+
+- **连接码授权**：首次配对/新设备必须输入被控端本地显示的一次性 6 位连接码（单次使用、2 分钟有效、错误限次防爆破）。
+- **设备指纹固定（TOFU）**：授权后双向 Ed25519 公钥写入信任库，后续连接凭签名握手免连接码；换设备或指纹变化需重新授权。房间号仅用于寻址，不构成授权。
+- **权限分级**：`readonly`（只读）/ `approve`（提示词 + 审批）/ `full`（含 shell、文件写入）；shell 受工作目录沙箱与命令黑白名单约束，`panic` 可立即断开。
+- **数据边界**：控制流量仅走 P2P（DTLS 端到端加密），不经服务器明文；断线期间的提示词与审批在控制端本地排队，恢复后自动补发，会话转录由被控端持久化并在重连后快照重放。
+
+### 测试
+
+```bash
+npm test                                    # 单测（含 daemon 控制面）
+npx playwright test e2e/harness-control.spec.ts   # 端到端（FakeAdapter）
+```
+
 ## 许可证
 
 本项目采用 [MIT License](LICENSE)。

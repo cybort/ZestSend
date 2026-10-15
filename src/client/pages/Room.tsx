@@ -38,6 +38,7 @@ import {
   RiPauseLine,
   RiPlayLine,
   RiRefreshLine,
+  RiRobotLine,
   RiShareForwardLine,
   RiRouterLine,
   RiSignalCellular1Fill,
@@ -70,6 +71,8 @@ import * as Y from "yjs";
 import Layout from "../components/Layout";
 import { CollaborationCanvas } from "../components/collaboration-canvas";
 import { CollaborationWorkspace } from "../components/collaboration-editor";
+import { HarnessWorkspace } from "../components/harness-workspace";
+import { HarnessController } from "../lib/harness";
 import { useTheme } from "../components/theme";
 import { AutoTransition } from "../components/ui/auto-transition";
 import { Clickable } from "../components/ui/clickable";
@@ -191,7 +194,7 @@ function displayedNumber(value: number, precision = 0): number {
 const ignoreDialogOpenChange = () => undefined;
 
 type RoomLocale = "en" | "zh";
-type WorkspaceId = "chat" | "files" | "video" | "voice" | "watch" | "collaborate" | "canvas" | "status";
+type WorkspaceId = "chat" | "files" | "harness" | "video" | "voice" | "watch" | "collaborate" | "canvas" | "status";
 type MeasuredFeature = "camera" | "canvas" | "chat" | "collaborate" | "files" | "screen_share" | "shared_playback" | "voice";
 
 function fileSizeBucket(size: number) {
@@ -269,6 +272,7 @@ const workspaceCopy = {
       chat: ["Chat", "Messages remain available while you work elsewhere."],
       collaborate: ["Collaborate", "A shared document for the room."],
       files: ["Files", "Send files or let the other participant choose what to receive."],
+      harness: ["Remote", "Control the AI coding agent on the other device."],
       status: ["Connection status", "Live measurements for this private room."],
       video: ["Video", "Video calls and screen sharing share one media session."],
       voice: ["Voice", "Keep a voice channel running in the background."],
@@ -292,6 +296,7 @@ const workspaceCopy = {
       chat: ["聊天", "切换到其他功能时，消息仍会保持可用。"],
       collaborate: ["协作", "在房间内共同编辑文档。"],
       files: ["文件", "发送文件，或让对方选择需要接收的文件。"],
+      harness: ["远程", "控制对方设备上运行的 AI 编码代理。"],
       status: ["连接状态", "查看这个私密房间的实时连接测量。"],
       video: ["视频", "视频通话与屏幕共享使用同一媒体会话。"],
       voice: ["语音", "在后台持续保持一条语音通道。"],
@@ -311,12 +316,13 @@ const workspaceCopy = {
   },
 } as const;
 
-const workspaceOrder: WorkspaceId[] = ["chat", "files", "video", "voice", "watch", "collaborate", "canvas", "status"];
+const workspaceOrder: WorkspaceId[] = ["chat", "files", "harness", "video", "voice", "watch", "collaborate", "canvas", "status"];
 const workspaceIcons = {
   canvas: RiBrushLine,
   chat: RiChat3Line,
   collaborate: RiFileEditLine,
   files: RiFolderTransferLine,
+  harness: RiRobotLine,
   status: RiPulseLine,
   video: RiVideoOnLine,
   voice: RiMicLine,
@@ -506,7 +512,7 @@ function StatusRow({ icon: Icon, label, locale, nonBlockingFailure = false, real
           type="fade"
         >
           {status.channels !== undefined ? (
-            <span className="text-sky-100/55">{status.channels} / 4</span>
+            <span className="text-sky-100/55">{status.channels} / 5</span>
           ) : status.latency !== undefined ? (
             <LatencyValue latency={status.latency} realtimeConnection={realtimeConnection} />
           ) : null}
@@ -2340,6 +2346,7 @@ function RoomWorkspace({
   collaborationProvider,
   collaborationPeerCursor,
   fileTransfers,
+  harnessController,
   locale,
   onExitComplete,
   onFeatureUsed,
@@ -2400,6 +2407,7 @@ function RoomWorkspace({
   collaborationProvider: P2PCollaborationProvider | null;
   collaborationPeerCursor: boolean;
   fileTransfers: FileTransferSnapshot[];
+  harnessController: HarnessController | null;
   locale: RoomLocale;
   onExitComplete?: () => void;
   onFeatureUsed: (feature: MeasuredFeature) => void;
@@ -2630,7 +2638,7 @@ function RoomWorkspace({
                 const isRunning = runningWorkspaces.includes(activeWorkspace);
 
                 return (
-                  <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" || activeWorkspace === "status" ? "flex h-full min-h-0 w-full flex-1 justify-center" : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
+                  <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "harness" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" || activeWorkspace === "status" ? "flex h-full min-h-0 w-full flex-1 justify-center" : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
                     {activeWorkspace === "chat" ? (
                       <ChatWorkspace
                         accent={theme.accent}
@@ -2649,6 +2657,8 @@ function RoomWorkspace({
                       />
                     ) : activeWorkspace === "files" ? (
                       <FileWorkspace accent={theme.accent} files={fileTransfers} locale={locale} onAccept={onAcceptFile} onCancel={onCancelFile} onDelete={onDeleteFile} onDiagnostics={onFileDiagnostics} onDownload={onDownloadFile} onOffer={onOfferFiles} onPause={onPauseFile} onResend={onResendFile} ready={progress.dataChannel.state === "active"} />
+                    ) : activeWorkspace === "harness" ? (
+                      <HarnessWorkspace controller={harnessController} locale={locale} />
                     ) : activeWorkspace === "watch" ? (
                       <WatchWorkspace
                         accent={theme.accent}
@@ -3030,6 +3040,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     dataChannel: { channels: 0, state: "pending", detail: "Waiting for data channel" },
   });
   const sessionRef = useRef<NativeWebRTCSession | null>(null);
+  const harnessControllerRef = useRef<HarnessController | null>(null);
   const fileManagerRef = useRef<FileTransferManager | null>(null);
   const lastTypingSentAtRef = useRef(0);
   const peerSessionGenerationRef = useRef(0);
@@ -3472,6 +3483,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
 
   useEffect(() => {
     renewPeerSessionScope();
+    harnessControllerRef.current = new HarnessController((json) => sessionRef.current?.sendHarness(json) ?? false);
     const showReconnectDialog = (kind: "peer-offline" | "peer-new" | "reserved" | "signaling", detail = "Reconnecting signaling socket") => {
       // Once the workspace is active, never cover the room with the full-screen
       // connection dialog: keep editing available and surface a corner toast.
@@ -3528,6 +3540,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
         }
         fileManagerRef.current?.onTransportReady();
         void session.pullMailboxMessages();
+        void harnessControllerRef.current?.start();
         if (!connectionReportedRef.current) {
           connectionReportedRef.current = true;
           trackInsightEvent("p2p_session_connected", { locale });
@@ -3614,6 +3627,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       () => {
         if (resetParticipantResources(session)) showReconnectDialog("peer-new", "Connecting to the new participant");
       },
+      (data) => { void harnessControllerRef.current?.handleHostMessage(data); },
     );
     sessionRef.current = session;
     connectionReportedRef.current = false;
@@ -3735,7 +3749,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     if (!file) return null;
     return { file, transport: await sessionRef.current?.getTransportDiagnostics() ?? {
       availableOutgoingBitrate: null,
-      bufferedAmount: { bulk: null, collaboration: null, control: null, interactive: null },
+      bufferedAmount: { bulk: null, collaboration: null, control: null, harness: null, interactive: null },
       bytesReceived: null,
       bytesSent: null,
       currentRoundTripTime: null,
@@ -4178,6 +4192,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           collaborationProvider={collaborationProvider}
           collaborationPeerCursor={collaborationPeerCursor}
           fileTransfers={fileTransfers}
+          harnessController={harnessControllerRef.current}
           locale={locale}
           onFeatureUsed={reportFeatureUsage}
           onLeave={leave}

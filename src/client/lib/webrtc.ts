@@ -121,9 +121,9 @@ export type InteractiveMessage = {
   type: "chat";
 };
 
-type DataChannelName = "bulk" | "collaboration" | "control" | "interactive";
+type DataChannelName = "bulk" | "collaboration" | "control" | "harness" | "interactive";
 
-const DATA_CHANNEL_NAMES: DataChannelName[] = ["control", "interactive", "bulk", "collaboration"];
+const DATA_CHANNEL_NAMES: DataChannelName[] = ["control", "interactive", "harness", "bulk", "collaboration"];
 const DATA_CHANNEL_COUNT = DATA_CHANNEL_NAMES.length;
 /** Resume bulk sends once the buffer drains below this watermark (the hard cap in sendOnChannel is 3MB). */
 const BULK_BUFFERED_LOW_THRESHOLD = 2 * 1024 * 1024;
@@ -624,7 +624,7 @@ type V2Signal = SignalMessage & { from?: string; peerId?: string };
 
 /** WebRTC session with resumable signaling and peer renegotiation. */
 export class NativeWebRTCSession {
-  private channels: Record<DataChannelName, RTCDataChannel | null> = { bulk: null, collaboration: null, control: null, interactive: null };
+  private channels: Record<DataChannelName, RTCDataChannel | null> = { bulk: null, collaboration: null, control: null, harness: null, interactive: null };
   private collaborationListeners = new Set<(data: ArrayBuffer) => void>();
   private collaborationStatusListeners = new Set<(ready: boolean) => void>();
   private closed = false;
@@ -720,6 +720,7 @@ export class NativeWebRTCSession {
     private readonly onSharedPlaybackMessage: (message: SharedPlaybackMessage) => void,
     private readonly onStatus: (status: SessionStatus) => void = () => undefined,
     private readonly onPeerReplaced: () => void = () => undefined,
+    private readonly onHarnessMessage: (data: string) => void = () => undefined,
   ) {
     this.resumeToken = v2ReadResumeToken(roomId);
     this.mediaTransport = new MediaTransport(
@@ -857,6 +858,7 @@ export class NativeWebRTCSession {
 
   send(data: string | ArrayBuffer | Blob): boolean { return this.sendOnChannel("interactive", data); }
   sendBulk(data: string | ArrayBuffer | Blob): boolean { return this.sendOnChannel("bulk", data); }
+  sendHarness(data: string): boolean { return this.sendOnChannel("harness", data); }
   sendCollaboration(data: ArrayBuffer): boolean { return this.sendOnChannel("collaboration", data); }
   sendControlMessage(message: { type: string; [key: string]: unknown }): boolean {
     return this.sendOnChannel("control", JSON.stringify(message));
@@ -970,6 +972,7 @@ export class NativeWebRTCSession {
       bulk: this.channels.bulk?.readyState === "open" ? this.channels.bulk.bufferedAmount : null,
       collaboration: this.channels.collaboration?.readyState === "open" ? this.channels.collaboration.bufferedAmount : null,
       control: this.channels.control?.readyState === "open" ? this.channels.control.bufferedAmount : null,
+      harness: this.channels.harness?.readyState === "open" ? this.channels.harness.bufferedAmount : null,
       interactive: this.channels.interactive?.readyState === "open" ? this.channels.interactive.bufferedAmount : null,
     };
     const fallback = {
@@ -1488,6 +1491,7 @@ export class NativeWebRTCSession {
       this.receivedBytes += dataSize(event.data); this.updateDataTransferProgress();
       if (name === "control") this.handleDataChannelMessage(event.data);
       if (name === "interactive") this.handleInteractiveMessage(event.data);
+      if (name === "harness") this.onHarnessMessage(String(event.data));
       if (name === "bulk" && event.data instanceof ArrayBuffer) this.fileTransferManager?.handleSegment(event.data);
       if (name === "collaboration" && event.data instanceof ArrayBuffer) {
         for (const listener of this.collaborationListeners) listener(event.data);
