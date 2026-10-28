@@ -129,7 +129,7 @@ export function HarnessWorkspace({ controller, locale }: { controller: HarnessCo
     setFingerprint(controller.fingerprint);
     setPermissions(controller.permissions ?? null);
     setSessions(controller.sessionList);
-    setActiveSessionId((current) => current ?? controller.focusedSessionId ?? controller.sessionList[0]?.sessionId ?? null);
+    setActiveSessionId((current) => current ?? controller.focusedSessionId ?? controller.sessionList.at(0)?.sessionId ?? null);
     const offStatus = controller.on("status", (event) => {
       setAuth(event.auth);
       setStatusDetail(event.detail ?? null);
@@ -137,8 +137,9 @@ export function HarnessWorkspace({ controller, locale }: { controller: HarnessCo
       setPermissions(event.permissions ?? null);
     });
     const offSessions = controller.on("sessions", (event) => {
-      setSessions(event.sessions);
-      setActiveSessionId((current) => current ?? event.sessions[0]?.sessionId ?? null);
+      const sessions = Array.isArray(event.sessions) ? event.sessions : [];
+      setSessions(sessions);
+      setActiveSessionId((current) => current ?? sessions.at(0)?.sessionId ?? null);
     });
     const offState = controller.on("sessionState", (event) => {
       setTranscript((current) => ({

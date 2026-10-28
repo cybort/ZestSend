@@ -294,8 +294,12 @@ export class HarnessController {
         return;
       }
       case "session.list": {
-        this.sessions = hostMessage.sessions;
-        this.emit("sessions", { sessions: this.sessions });
+        // A second peer opening the same panel can deliver a list whose
+        // payload is missing or not an array. The workspace indexes it
+        // immediately, so a non-array must not reach the UI.
+        const sessions = Array.isArray(hostMessage.sessions) ? hostMessage.sessions : [];
+        this.sessions = sessions;
+        this.emit("sessions", { sessions });
         return;
       }
       case "session.snapshot": {
