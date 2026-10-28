@@ -2,6 +2,15 @@ export type SharedPlaybackKind = "audio" | "video";
 
 export type SharedPlaybackCommand = "play" | "pause" | "seek" | "rate" | "stop";
 
+export type SharedPlaybackDanmakuMessage = {
+  color: string;
+  danmakuId: string;
+  id: string;
+  text: string;
+  time: number;
+  type: "shared-playback-danmaku";
+};
+
 export type SharedPlaybackMessage =
   | {
       currentTime: number;
@@ -23,7 +32,28 @@ export type SharedPlaybackMessage =
   | {
       id: string;
       type: "shared-playback-stopped";
-    };
+    }
+  | SharedPlaybackDanmakuMessage;
+
+const DANMAKU_COLORS = new Set(["#ffffff", "#ffe86a", "#8defff", "#ffad61", "#ff91ca"]);
+export const DANMAKU_DURATION_SECONDS = 9;
+export const DANMAKU_LANES = 6;
+
+export function isDanmakuText(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.trim().length <= 40;
+}
+
+export function danmakuLane(danmakuId: string): number {
+  return [...danmakuId].reduce((total, character) => total + character.charCodeAt(0), 0) % DANMAKU_LANES;
+}
+
+export function danmakuIsVisible(danmakuTime: number, playbackTime: number): boolean {
+  return danmakuTime <= playbackTime && playbackTime - danmakuTime < DANMAKU_DURATION_SECONDS;
+}
+
+export function danmakuProgress(danmakuTime: number, playbackTime: number): number {
+  return Math.min(1, Math.max(0, (playbackTime - danmakuTime) / DANMAKU_DURATION_SECONDS));
+}
 
 function isFiniteTime(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -43,6 +73,18 @@ export function isSharedPlaybackMessage(value: unknown): value is SharedPlayback
     if (message.command !== "play" && message.command !== "pause" && message.command !== "seek" && message.command !== "rate" && message.command !== "stop") return false;
     if (message.currentTime !== undefined && !isFiniteTime(message.currentTime)) return false;
     return message.playbackRate === undefined || (typeof message.playbackRate === "number" && Number.isFinite(message.playbackRate) && message.playbackRate >= 0.25 && message.playbackRate <= 4);
+  }
+
+  if (message.type === "shared-playback-danmaku") {
+    const danmaku = message as Partial<SharedPlaybackDanmakuMessage>;
+    return isDanmakuText(danmaku.text)
+      && typeof danmaku.danmakuId === "string"
+      && danmaku.danmakuId.length > 0
+      && danmaku.danmakuId.length <= 128
+      && typeof danmaku.color === "string"
+      && DANMAKU_COLORS.has(danmaku.color)
+      && isFiniteTime(danmaku.time)
+      && danmaku.time <= 86_400;
   }
 
   return message.type === "shared-playback-state"

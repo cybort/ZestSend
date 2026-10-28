@@ -6,7 +6,7 @@ import { defineConfig } from "vitest/config";
  */
 export default defineConfig({
   test: {
-    include: ["test/harness-daemon.test.ts"],
+    include: ["test/harness-daemon.test.ts", "test/shared-playback.test.ts"],
     environment: "node",
     maxWorkers: 1,
     fileParallelism: false,

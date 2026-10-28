@@ -45,6 +45,7 @@ import {
   RiSignalCellular2Fill,
   RiSignalCellular3Fill,
   RiSendPlane2Fill,
+  RiChatQuoteLine,
   RiStopLine,
   RiSpeedLine,
   RiLogoutBoxRLine,
@@ -83,7 +84,7 @@ import { FileTransferManager, type FileTransferDiagnostics, type FileTransferSna
 import { trackInsightEvent } from "../lib/insightflare";
 import type { MediaTransport } from "../lib/media-transport";
 import { P2PCollaborationProvider } from "../lib/p2p-collaboration";
-import type { SharedPlaybackCommand, SharedPlaybackMessage } from "../lib/shared-playback";
+import { danmakuIsVisible, danmakuLane, danmakuProgress, isDanmakuText, type SharedPlaybackCommand, type SharedPlaybackDanmakuMessage, type SharedPlaybackMessage } from "../lib/shared-playback";
 import {
   NativeWebRTCSession,
   type ConnectionRoute,
@@ -1124,6 +1125,21 @@ type SharedPlayback = {
   playing: boolean;
 };
 
+type PlaybackDanmaku = {
+  color: string;
+  id: string;
+  lane: number;
+  sender: "local" | "remote";
+  text: string;
+  time: number;
+};
+
+const DANMAKU_COLORS = ["#ffffff", "#ffe86a", "#8defff", "#ffad61", "#ff91ca"] as const;
+
+function playbackDanmaku(message: SharedPlaybackDanmakuMessage, sender: PlaybackDanmaku["sender"]): PlaybackDanmaku {
+  return { color: message.color, id: message.danmakuId, lane: danmakuLane(message.danmakuId), sender, text: message.text.trim(), time: message.time };
+}
+
 type PeerSessionScope = {
   generation: number;
   media: MediaTransport;
@@ -1668,23 +1684,27 @@ function formatPlaybackTime(value: number): string {
 
 function WatchWorkspace({
   accent,
+  danmaku,
   error,
   locale,
   media,
   onControl,
   onOpenFile,
   onOpenSpeakerDialog,
+  onSendDanmaku,
   playback,
   ready,
   speakerActive,
 }: {
   accent: string;
+  danmaku: PlaybackDanmaku[];
   error: string | null;
   locale: RoomLocale;
   media: MediaTransport | null;
   onControl: (command: SharedPlaybackCommand, options?: { currentTime?: number; playbackRate?: number }) => void;
   onOpenFile: (file: File) => Promise<void>;
   onOpenSpeakerDialog: () => void;
+  onSendDanmaku: (text: string, color: string) => boolean;
   playback: SharedPlayback | null;
   ready: boolean;
   speakerActive: boolean;
@@ -1697,6 +1717,9 @@ function WatchWorkspace({
   const [playbackChromeVisible, setPlaybackChromeVisible] = useState(false);
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [danmakuDraft, setDanmakuDraft] = useState("");
+  const [danmakuColor, setDanmakuColor] = useState<string>(DANMAKU_COLORS[0]);
+  const [danmakuEnabled, setDanmakuEnabled] = useState(true);
   const copy = locale === "zh" ? {
     choose: "选择本地音频或视频",
     current: "正在同播",
@@ -1711,6 +1734,11 @@ function WatchWorkspace({
     speed: "播放速度",
     stop: "结束同播",
     timeline: "播放进度",
+    danmaku: "弹幕",
+    danmakuHide: "隐藏弹幕",
+    danmakuPlaceholder: "发一条弹幕",
+    danmakuShow: "显示弹幕",
+    danmakuSend: "发送弹幕",
   } : {
     choose: "Choose local media",
     current: "NOW PLAYING",
@@ -1725,6 +1753,11 @@ function WatchWorkspace({
     speed: "Speed",
     stop: "End session",
     timeline: "Playback position",
+    danmaku: "Danmaku",
+    danmakuHide: "Hide danmaku",
+    danmakuPlaceholder: "Send a comment",
+    danmakuShow: "Show danmaku",
+    danmakuSend: "Send danmaku",
   };
 
   useEffect(() => {
@@ -1784,6 +1817,15 @@ function WatchWorkspace({
     setPlaybackChromeVisible(false);
     setSpeedMenuOpen(false);
   }, [playback?.id]);
+
+  const sendDanmaku = () => {
+    if (!isDanmakuText(danmakuDraft) || !onSendDanmaku(danmakuDraft, danmakuColor)) return;
+    setDanmakuDraft("");
+  };
+  const playbackTime = playback?.currentTime ?? 0;
+  const visibleDanmaku = danmakuEnabled
+    ? danmaku.filter((item) => danmakuIsVisible(item.time, playbackTime))
+    : [];
 
   return <VideoShell
     footer={<div className="flex h-full items-center justify-center gap-4 sm:gap-10">
@@ -1868,12 +1910,23 @@ function WatchWorkspace({
               <p className="mt-2 text-sm font-bold tracking-[0.08em] text-sky-100/60">{copy.noVideo}</p>
             </div>
           )}
+          <div aria-live="polite" className="pointer-events-none absolute inset-x-0 top-4 bottom-36 overflow-hidden">
+            {visibleDanmaku.map((item) => (
+              <span
+                className="absolute whitespace-nowrap rounded-full bg-black/45 px-3 py-1 text-sm font-bold tracking-[0.03em] shadow-lg shadow-black/30"
+                key={item.id}
+                style={{ color: item.color, left: `${100 - danmakuProgress(item.time, playbackTime) * 120}%`, top: `${8 + item.lane * 13}%` }}
+              >
+                {item.text}
+              </span>
+            ))}
+          </div>
           <div className={`absolute inset-x-0 top-0 flex items-start justify-between gap-3 bg-gradient-to-b from-black/70 to-transparent px-5 py-4 transition-opacity duration-200 ${showPlaybackChrome ? "opacity-100" : "pointer-events-none opacity-0"}`}>
             <div className="min-w-0"><p className="text-[10px] font-bold tracking-[0.16em] text-sky-100/55">{copy.current}</p><p className="mt-1 truncate text-sm font-bold tracking-[0.04em] text-sky-50 sm:text-base">{playback.name}</p></div>
             {playback.owner === "remote" ? <span className="shrink-0 rounded-full border border-white/10 bg-black/35 px-2.5 py-1 text-[10px] font-bold tracking-[0.1em] text-sky-100/70">{copy.remote}</span> : null}
           </div>
-          <div className={`absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/55 to-transparent px-5 pb-4 pt-12 transition-opacity duration-200 ${showPlaybackChrome ? "opacity-100" : "pointer-events-none opacity-0"}`}>
-            <label className="block" aria-label={copy.timeline}>
+          <div className={`absolute inset-x-0 bottom-16 bg-gradient-to-t from-black/85 via-black/55 to-transparent px-5 pb-4 pt-12 transition-opacity duration-200 ${showPlaybackChrome ? "opacity-100" : "opacity-0"}`}>
+            <label className="block">
               <input aria-label={copy.timeline} className="h-1.5 w-full cursor-pointer accent-sky-200" disabled={!ready} max={duration} min="0" onChange={(event) => onControl("seek", { currentTime: Number(event.target.value) })} step="0.1" type="range" value={currentTime} />
             </label>
             <div className="mt-2 flex items-center justify-between font-mono text-xs font-semibold tabular-nums text-sky-100/75"><span>{formatPlaybackTime(currentTime)}</span><span>{formatPlaybackTime(playback.duration)}</span></div>
@@ -1884,8 +1937,49 @@ function WatchWorkspace({
               </div>
               {playback.kind === "video" ? <button aria-label={isFullscreen ? copy.exitFullscreen : copy.fullscreen} className="grid size-9 place-items-center rounded-lg border border-white/10 bg-black/20 text-sky-100/80 transition-colors hover:bg-white/10 hover:text-sky-50" onClick={toggleFullscreen} type="button">{isFullscreen ? <RiFullscreenExitLine aria-hidden="true" className="size-4" /> : <RiFullscreenLine aria-hidden="true" className="size-4" />}</button> : null}
             </div>
-            {error ? <p className="mt-3 text-center text-xs font-semibold tracking-[0.03em] text-rose-200">{error}</p> : null}
           </div>
+          <form className="absolute inset-x-0 bottom-0 flex items-center gap-2 bg-black/55 px-5 py-3 backdrop-blur-md" onSubmit={(event) => { event.preventDefault(); sendDanmaku(); }}>
+            <button
+              aria-pressed={danmakuEnabled}
+              aria-label={danmakuEnabled ? copy.danmakuHide : copy.danmakuShow}
+              className="grid size-9 shrink-0 place-items-center rounded-lg border border-white/10 bg-black/20 text-sky-100/80 transition-colors hover:bg-white/10 hover:text-sky-50"
+              onClick={() => setDanmakuEnabled((current) => !current)}
+              style={{ backgroundColor: danmakuEnabled ? `${accent}33` : undefined }}
+              type="button"
+            >
+              <RiChatQuoteLine aria-hidden="true" className="size-4" />
+            </button>
+            <input
+              aria-label={copy.danmaku}
+              className="h-9 min-w-0 flex-1 rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-medium tracking-[0.03em] text-sky-50 outline-none placeholder:text-sky-100/35 focus:border-sky-100/35"
+              maxLength={40}
+              onChange={(event) => setDanmakuDraft(event.target.value)}
+              placeholder={copy.danmakuPlaceholder}
+              value={danmakuDraft}
+            />
+            <div className="hidden shrink-0 items-center gap-1 sm:flex">
+              {DANMAKU_COLORS.map((color) => (
+                <button
+                  aria-label={color}
+                  className="size-4 rounded-full border border-white/30"
+                  key={color}
+                  onClick={() => setDanmakuColor(color)}
+                  style={{ backgroundColor: color, outline: danmakuColor === color ? "2px solid rgb(224 242 254 / 0.8)" : undefined, outlineOffset: 2 }}
+                  type="button"
+                />
+              ))}
+            </div>
+            <button
+              aria-label={copy.danmakuSend}
+              className="grid size-9 shrink-0 place-items-center rounded-lg text-sky-50 disabled:cursor-not-allowed disabled:opacity-35"
+              disabled={!ready || !isDanmakuText(danmakuDraft)}
+              style={{ backgroundColor: accent }}
+              type="submit"
+            >
+              <RiSendPlane2Fill aria-hidden="true" className="size-4" />
+            </button>
+          </form>
+          {error ? <p className="mt-3 text-center text-xs font-semibold tracking-[0.03em] text-rose-200">{error}</p> : null}
         </div>
       </div>}
       </AutoTransition>
@@ -2370,9 +2464,11 @@ function RoomWorkspace({
   microphonePending,
   media,
   sharedPlayback,
+  sharedPlaybackDanmaku,
   sharedPlaybackError,
   onOpenSharedPlayback,
   onSharedPlaybackControl,
+  onSendSharedPlaybackDanmaku,
   noiseReductionActive,
   onToggleNoiseReduction,
   onSelectMicrophone,
@@ -2431,9 +2527,11 @@ function RoomWorkspace({
   microphonePending: boolean;
   media: MediaTransport | null;
   sharedPlayback: SharedPlayback | null;
+  sharedPlaybackDanmaku: PlaybackDanmaku[];
   sharedPlaybackError: string | null;
   onOpenSharedPlayback: (file: File) => Promise<void>;
   onSharedPlaybackControl: (command: SharedPlaybackCommand, options?: { currentTime?: number; playbackRate?: number }) => void;
+  onSendSharedPlaybackDanmaku: (text: string, color: string) => boolean;
   noiseReductionActive: boolean;
   onToggleNoiseReduction: () => void;
   onSelectMicrophone: (deviceId: string) => Promise<boolean>;
@@ -2641,7 +2739,7 @@ function RoomWorkspace({
                 const isRunning = runningWorkspaces.includes(activeWorkspace);
 
                 return (
-                  <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "harness" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" || activeWorkspace === "status" ? `flex h-full min-h-0 w-full flex-1 justify-center ${activeWorkspace === "harness" ? "pb-36" : ""}` : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
+                  <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "harness" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" || activeWorkspace === "status" ? `flex h-full min-h-0 w-full flex-1 justify-center ${activeWorkspace === "harness" || activeWorkspace === "watch" ? "pb-36" : ""}` : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
                     {activeWorkspace === "chat" ? (
                       <ChatWorkspace
                         accent={theme.accent}
@@ -2665,12 +2763,14 @@ function RoomWorkspace({
                     ) : activeWorkspace === "watch" ? (
                       <WatchWorkspace
                         accent={theme.accent}
+                        danmaku={sharedPlaybackDanmaku}
                         error={sharedPlaybackError}
                         locale={locale}
                         media={media}
                         onControl={onSharedPlaybackControl}
                         onOpenFile={onOpenSharedPlayback}
                         onOpenSpeakerDialog={() => setSpeakerDialogOpen(true)}
+                        onSendDanmaku={onSendSharedPlaybackDanmaku}
                         playback={sharedPlayback}
                         ready={progress.dataChannel.state === "active"}
                         speakerActive={speakerActive}
@@ -2924,6 +3024,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   const [videoQuality, setVideoQuality] = useState<VideoQuality>("balanced");
   const [peerTyping, setPeerTyping] = useState(false);
   const [sharedPlayback, setSharedPlayback] = useState<SharedPlayback | null>(null);
+  const [sharedPlaybackDanmaku, setSharedPlaybackDanmaku] = useState<PlaybackDanmaku[]>([]);
   const [sharedPlaybackError, setSharedPlaybackError] = useState<string | null>(null);
   const chatMessagesRef = useRef<ChatMessage[]>([]);
   const fileTransfersRef = useRef<FileTransferSnapshot[]>([]);
@@ -2941,6 +3042,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
   const sharedPlaybackObjectUrlRef = useRef<string | null>(null);
   const sharedPlaybackTransitionRef = useRef(false);
   const sharedPlaybackLastSyncRef = useRef(0);
+  const sharedPlaybackClockRef = useRef(0);
   const cameraTrackRef = useRef<MediaStreamTrack | null>(null);
   const screenVideoTrackRef = useRef<MediaStreamTrack | null>(null);
   const screenAudioTrackRef = useRef<MediaStreamTrack | null>(null);
@@ -3169,6 +3271,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     const now = performance.now();
     if (!force && now - sharedPlaybackLastSyncRef.current < 750) return;
     sharedPlaybackLastSyncRef.current = now;
+    sharedPlaybackClockRef.current = now;
     const next: SharedPlayback = {
       ...playback,
       currentTime: Number.isFinite(element.currentTime) ? Math.max(0, element.currentTime) : 0,
@@ -3202,6 +3305,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
 
     if (announce && sessionRef.current === session) session?.sendControlMessage({ id: playback.id, type: "shared-playback-stopped" });
     updateSharedPlayback(null);
+    setSharedPlaybackDanmaku([]);
     setSharedPlaybackError(null);
     if (element) {
       element.pause();
@@ -3281,6 +3385,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     const sourceUrl = URL.createObjectURL(file);
     sharedPlaybackObjectUrlRef.current = sourceUrl;
     updateSharedPlayback({ currentTime: 0, duration: 0, id, kind: initialKind, name: file.name, owner: "local", playbackRate: 1, playing: false });
+    setSharedPlaybackDanmaku([]);
     let capturedTracks: MediaStreamTrack[] = [];
 
     try {
@@ -3323,6 +3428,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       if (isAbortError(cause)) {
         if (ownsPlayback) {
           updateSharedPlayback(null);
+          setSharedPlaybackDanmaku([]);
           element.pause();
           element.removeAttribute("src");
           element.load();
@@ -3357,17 +3463,55 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     });
   };
 
+  const sendSharedPlaybackDanmaku = (text: string, color: string): boolean => {
+    const playback = sharedPlaybackRef.current;
+    const trimmed = text.trim();
+    if (!playback || !isDanmakuText(trimmed) || !DANMAKU_COLORS.includes(color as typeof DANMAKU_COLORS[number])) return false;
+    const message: SharedPlaybackDanmakuMessage = {
+      color,
+      danmakuId: cuid(),
+      id: playback.id,
+      text: trimmed,
+      time: playback.currentTime,
+      type: "shared-playback-danmaku",
+    };
+    const sent = sessionRef.current?.sendControlMessage(message) ?? false;
+    if (!sent) return false;
+    setSharedPlaybackDanmaku((current) => [...current, playbackDanmaku(message, "local")].slice(-80));
+    return true;
+  };
+
   const handleSharedPlaybackMessage = (message: SharedPlaybackMessage) => {
+    if (message.type === "shared-playback-danmaku") {
+      const current = sharedPlaybackRef.current;
+      if (!current || current.id !== message.id) return;
+      setSharedPlaybackDanmaku((items) => items.some((item) => item.id === message.danmakuId)
+        ? items
+        : [...items, playbackDanmaku(message, "remote")].slice(-80));
+      return;
+    }
     if (message.type === "shared-playback-state") {
       const current = sharedPlaybackRef.current;
       if (current?.owner === "local") return;
+      if (current?.id !== message.id) setSharedPlaybackDanmaku([]);
+      const audio = remotePlaybackAudioRef.current;
+      if (audio) {
+        audio.playbackRate = message.playbackRate;
+        if (!message.playing) audio.pause();
+        else if (audio.paused) void audio.play().catch(() => undefined);
+        if (Math.abs(audio.currentTime - message.currentTime) > 0.75) audio.currentTime = message.currentTime;
+      }
+      sharedPlaybackClockRef.current = performance.now();
       updateSharedPlayback({ ...message, owner: "remote" });
       setSharedPlaybackError(null);
       return;
     }
     if (message.type === "shared-playback-stopped") {
       const current = sharedPlaybackRef.current;
-      if (current?.owner === "remote" && current.id === message.id) updateSharedPlayback(null);
+      if (current?.owner === "remote" && current.id === message.id) {
+        updateSharedPlayback(null);
+        setSharedPlaybackDanmaku([]);
+      }
       return;
     }
     const current = sharedPlaybackRef.current;
@@ -3381,7 +3525,17 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     const onEnded = () => { void clearLocalSharedPlayback(); };
     for (const event of ["play", "pause", "ratechange", "seeked", "timeupdate"]) element.addEventListener(event, publish);
     element.addEventListener("ended", onEnded);
+    const clock = window.setInterval(() => {
+      const playback = sharedPlaybackRef.current;
+      if (!playback?.playing) return;
+      updateSharedPlayback({
+        ...playback,
+        currentTime: playback.currentTime + (performance.now() - sharedPlaybackClockRef.current) / 1_000 * playback.playbackRate,
+      });
+      sharedPlaybackClockRef.current = performance.now();
+    }, 100);
     return () => {
+      window.clearInterval(clock);
       for (const event of ["play", "pause", "ratechange", "seeked", "timeupdate"]) element.removeEventListener(event, publish);
       element.removeEventListener("ended", onEnded);
       sharedPlaybackTransitionRef.current = true;
@@ -3459,7 +3613,10 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
     setFileTransfers([]);
     void fileManagerRef.current?.clearSession();
     void clearLocalSharedPlayback(false);
-    if (sharedPlaybackRef.current?.owner === "remote") updateSharedPlayback(null);
+    if (sharedPlaybackRef.current?.owner === "remote") {
+      updateSharedPlayback(null);
+      setSharedPlaybackDanmaku([]);
+    }
     session.media.stopLocalTracks();
     rawMicrophoneTrackRef.current?.stop();
     rawMicrophoneTrackRef.current = null;
@@ -3700,6 +3857,7 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
       setScreenAudioFallbackOpen(false);
       setVideoQuality("balanced");
       updateSharedPlayback(null);
+      setSharedPlaybackDanmaku([]);
       setSharedPlaybackError(null);
     };
   }, [roomId]);
@@ -4210,9 +4368,11 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
           onResendFile={resendFile}
           media={mediaTransport}
           sharedPlayback={sharedPlayback}
+          sharedPlaybackDanmaku={sharedPlaybackDanmaku}
           sharedPlaybackError={sharedPlaybackError}
           onOpenSharedPlayback={openSharedPlayback}
           onSharedPlaybackControl={controlSharedPlayback}
+          onSendSharedPlaybackDanmaku={sendSharedPlaybackDanmaku}
           microphoneActive={microphoneActive}
           microphoneDeviceId={microphoneDeviceId}
           microphoneError={microphoneError}
