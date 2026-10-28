@@ -2641,7 +2641,7 @@ function RoomWorkspace({
                 const isRunning = runningWorkspaces.includes(activeWorkspace);
 
                 return (
-                  <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "harness" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" || activeWorkspace === "status" ? "flex h-full min-h-0 w-full flex-1 justify-center" : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
+                  <section className={activeWorkspace === "chat" || activeWorkspace === "collaborate" || activeWorkspace === "canvas" || activeWorkspace === "files" || activeWorkspace === "harness" || activeWorkspace === "video" || activeWorkspace === "voice" || activeWorkspace === "watch" || activeWorkspace === "status" ? `flex h-full min-h-0 w-full flex-1 justify-center ${activeWorkspace === "harness" ? "pb-36" : ""}` : "flex min-h-0 w-full flex-1 items-center justify-center py-6"}>
                     {activeWorkspace === "chat" ? (
                       <ChatWorkspace
                         accent={theme.accent}

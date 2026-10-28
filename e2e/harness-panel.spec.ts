@@ -31,8 +31,24 @@ test("both peers can open the agent tab without crashing", async ({ browser }) =
     await bob.getByRole("button", { name: "终端", exact: true }).click();
     await alice.getByRole("button", { name: "代理", exact: true }).click();
     await bob.getByRole("button", { name: "代理", exact: true }).click();
-    await expect(alice.getByPlaceholder("向代理发送提示词…")).toBeVisible();
+    const composer = alice.getByPlaceholder("向代理发送提示词…");
+    const send = alice.getByRole("button", { name: "发送" });
+    await expect(composer).toBeVisible();
     await expect(bob.getByPlaceholder("向代理发送提示词…")).toBeVisible();
+    const clearsDock = (selector: string) => alice.evaluate((query) => {
+      const control = document.querySelector<HTMLElement>(query);
+      const dock = document.querySelector<HTMLElement>(".zest-room-dock");
+      if (!control || !dock) return false;
+      return control.getBoundingClientRect().bottom <= dock.getBoundingClientRect().top + 1;
+    }, selector);
+    expect(await clearsDock('textarea[placeholder="向代理发送提示词…"]')).toBe(true);
+    const panelTab = (name: string) => alice.locator("main").getByRole("button", { name, exact: true });
+    await panelTab("终端").click();
+    expect(await clearsDock('input[placeholder="在主机上执行的命令…"]')).toBe(true);
+    await panelTab("文件").click();
+    expect(await clearsDock('input[placeholder="主机工作区内的路径"]')).toBe(true);
+    await panelTab("代理").click();
+    await expect(send).toBeVisible();
     expect(errors.filter((entry) => entry.includes("reading '0'"))).toEqual([]);
   } finally {
     await aliceContext.close();
