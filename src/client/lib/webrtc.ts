@@ -669,6 +669,10 @@ export class NativeWebRTCSession {
   private icePreparationListener: IcePreparationListener | null = null;
   private icePreparationPromise: Promise<void> | null = null;
   private socket: WebSocket | null = null;
+  private signalingTransport: "websocket" | "http" = "websocket";
+  private httpConnectionId: string | null = null;
+  private httpPollTimer: number | undefined;
+  private httpPollInFlight = false;
   private socketGeneration = 0;
   private socketMode: V2HelloMode = "new";
   private reconnectMode: V2HelloMode = "new";
@@ -754,6 +758,7 @@ export class NativeWebRTCSession {
     });
     this.clearReconnectTimer();
     this.stopHeartbeat();
+    this.stopHttpPolling();
     this.stopDataChannelLatencyProbe();
     this.socketGeneration += 1;
     const socket = this.socket;
@@ -808,8 +813,9 @@ export class NativeWebRTCSession {
     this.reportStatus({ p2pState: "disconnected", seatState: "unassigned", signalingState: "closed", state: "closed" });
     this.clearReconnectTimer();
     this.stopHeartbeat();
+    this.stopHttpPolling();
     this.stopDataChannelLatencyProbe();
-    if (this.socket?.readyState === WebSocket.OPEN) {
+    if (this.signalingTransport === "http" || this.socket?.readyState === WebSocket.OPEN) {
       this.sendSocket({ type: "leave" });
       this.leaveAckTimer = window.setTimeout(() => this.finishClose(), 500);
     } else {
@@ -830,6 +836,8 @@ export class NativeWebRTCSession {
       this.icePreparationListener = null;
     }
     this.stopHeartbeat();
+    this.stopHttpPolling();
+    this.httpConnectionId = null;
     this.stopDataChannelLatencyProbe();
     this.closeDataChannels();
     this.mediaTransport.dispose();
@@ -1028,12 +1036,53 @@ export class NativeWebRTCSession {
     return this.icePreparationPromise;
   }
 
+  private startHttpSignaling(mode: V2HelloMode): void {
+    this.stopHttpPolling();
+    this.signalingTransport = "http";
+    this.socketMode = mode;
+    this.reconnectMode = mode;
+    this.setStep("websocket", { state: "checking", detail: "WebSocket blocked; using HTTPS signaling fallback" });
+    this.reportStatus({ detail: "Opening HTTPS signaling fallback", signalingState: "connecting", state: this.isP2PHealthy() ? "connected" : "connecting" });
+    const generation = ++this.socketGeneration;
+    const hello = { type: "hello", mode, ...(mode === "new" || !this.resumeToken ? {} : { resumeToken: this.resumeToken }), capabilities: [SIGNALING_HEARTBEAT_CAPABILITY] };
+    const poll = async () => {
+      if (generation !== this.socketGeneration || this.closed || this.suspended || this.httpPollInFlight) return;
+      this.httpPollInFlight = true;
+      try {
+        const response = await fetch(`/api/rooms/${this.roomId}/signal`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...(this.httpConnectionId ? { "x-zestsend-connection": this.httpConnectionId } : {}) },
+          body: JSON.stringify(this.httpConnectionId ? { type: "ping" } : hello),
+        });
+        const connectionId = response.headers.get("x-zestsend-connection");
+        if (connectionId) this.httpConnectionId = connectionId;
+        const body = await response.text();
+        if (generation !== this.socketGeneration) return;
+        for (const line of body.split("\n").map((entry) => entry.trim()).filter(Boolean)) this.handleSocketMessage(line);
+        if (response.ok) this.setStep("websocket", { state: "active", detail: "HTTPS signaling fallback connected" });
+      } catch {
+        if (generation === this.socketGeneration) this.setStep("websocket", { state: "checking", detail: "Retrying HTTPS signaling fallback" });
+      } finally {
+        this.httpPollInFlight = false;
+      }
+    };
+    void poll();
+    this.httpPollTimer = window.setInterval(() => void poll(), 2_000);
+  }
+
+  private stopHttpPolling(): void {
+    if (this.httpPollTimer !== undefined) window.clearInterval(this.httpPollTimer);
+    this.httpPollTimer = undefined;
+    this.httpPollInFlight = false;
+  }
+
   private openSocket(mode: V2HelloMode, resetBackoff = false): void {
     if (this.closed || this.suspended) return;
     if (this.seatState === "expired" && this.isP2PHealthy()) return;
     this.clearReconnectTimer();
     if (resetBackoff) this.reconnectAttempt = 0;
     this.stopHeartbeat();
+    if (this.signalingTransport === "http") { this.startHttpSignaling(mode); return; }
     const previous = this.socket;
     if (previous && previous.readyState !== WebSocket.CLOSED) {
       previous.onopen = null; previous.onmessage = null; previous.onerror = null; previous.onclose = null;
@@ -1092,6 +1141,11 @@ export class NativeWebRTCSession {
           state: this.isP2PHealthy() ? "connected" : "reconnecting",
         });
         if (this.seatState === "expired" && this.isP2PHealthy()) return;
+        if (this.reconnectAttempt >= 2 && this.signalingTransport === "websocket" && !this.hasAdmittedSeat) {
+          this.signalingTransport = "http";
+          this.startHttpSignaling(this.reconnectMode);
+          return;
+        }
         this.scheduleSocketReconnect(this.reconnectMode);
       };
     } catch { this.scheduleSocketReconnect(mode); }
@@ -1841,6 +1895,18 @@ export class NativeWebRTCSession {
   private sendSocket(message: object): boolean {
     const messageType = (message as { type?: unknown }).type;
     const leavingMessage = this.leaving && messageType === "leave";
+    if (this.signalingTransport === "http") {
+      if (this.suspended || (this.closed && !leavingMessage) || !this.httpConnectionId) return false;
+      void fetch(`/api/rooms/${this.roomId}/signal`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-zestsend-connection": this.httpConnectionId },
+        body: JSON.stringify(message),
+      }).then(async (response) => {
+        const body = await response.text();
+        for (const line of body.split("\n").map((entry) => entry.trim()).filter(Boolean)) this.handleSocketMessage(line);
+      }).catch(() => undefined);
+      return true;
+    }
     if (this.suspended || (this.closed && !leavingMessage) || this.socket?.readyState !== WebSocket.OPEN) return false;
     try { this.socket.send(JSON.stringify(message)); return true; } catch { return false; }
   }

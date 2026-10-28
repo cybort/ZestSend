@@ -123,6 +123,12 @@ async function createRoomPeer(page: Page, roomId: string, interceptSignaling = t
       client.onClose(() => server.close({ code: 1001, reason: "Signaling interruption under test." }));
       server.onClose(() => client.close({ code: 1001, reason: "Signaling interruption under test." }));
     });
+    // HTTPS long-polling is the other signaling transport. A signaling outage
+    // under test has to stop both, or the client re-admits the seat over HTTP.
+    await page.route(/\/api\/rooms\/\d{6}\/signal(?:\?.*)?$/, (route) => {
+      if (blockNewSockets) return route.abort();
+      return route.continue();
+    });
     routeRegistered = true;
   };
   await page.route("**/api/turn/credentials", (route) => route.fulfill({

@@ -36,6 +36,9 @@ type Listener<K extends keyof SignalingEvents> = (event: SignalingEvents[K]) => 
  */
 export class SignalingClient {
   private socket: WebSocket | null = null;
+  private httpConnectionId: string | null = null;
+  private httpTimer: NodeJS.Timeout | null = null;
+  private usingHttp = false;
   private slotId: string | null = null;
   private peerSessionId: string | null = null;
   private epoch = 0;
@@ -58,6 +61,19 @@ export class SignalingClient {
   };
 
   constructor(private readonly url: string) {}
+
+  private httpUrl(): string { return this.url.replace(/^ws/, "http").replace(/\/ws(?:\?.*)?$/, "/signal"); }
+
+  private async httpExchange(message: Record<string, unknown>, connectionId?: string | null): Promise<void> {
+    const response = await fetch(this.httpUrl(), {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(connectionId ? { "x-zestsend-connection": connectionId } : {}) },
+      body: JSON.stringify(message),
+    });
+    const nextId = response.headers.get("x-zestsend-connection");
+    if (nextId) this.httpConnectionId = nextId;
+    for (const line of (await response.text()).split("\n").map((entry) => entry.trim()).filter(Boolean)) this.handleMessage(line);
+  }
 
   on<K extends keyof SignalingEvents>(event: K, listener: Listener<K>): () => void {
     this.listeners[event].add(listener);
@@ -86,6 +102,7 @@ export class SignalingClient {
       this.stopHeartbeat();
       this.socket = null;
       if (this.closed) return;
+      if (this.reconnectAttempt >= 2 && !this.usingHttp) { this.startHttpFallback(); return; }
       this.scheduleReconnect();
     });
     socket.on("error", () => {
@@ -127,7 +144,23 @@ export class SignalingClient {
     this.heartbeatTimer = null;
   }
 
+  private startHttpFallback(): void {
+    this.usingHttp = true;
+    this.stopHeartbeat();
+    const poll = async () => {
+      if (this.closed) return;
+      try {
+        await this.httpExchange(this.httpConnectionId ? { type: "ping" } : {
+          type: "hello", mode: this.resumeToken ? "resume-signaling" : "new", ...(this.resumeToken ? { resumeToken: this.resumeToken } : {}), capabilities: [SIGNALING_HEARTBEAT_CAPABILITY],
+        }, this.httpConnectionId);
+      } catch { /* the next poll retries */ }
+    };
+    void poll();
+    this.httpTimer = setInterval(() => void poll(), 2_000);
+  }
+
   private send(message: Record<string, unknown>): void {
+    if (this.usingHttp) { void this.httpExchange(message, this.httpConnectionId).catch(() => undefined); return; }
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
   }
 
@@ -205,6 +238,7 @@ export class SignalingClient {
   close(): void {
     this.closed = true;
     this.stopHeartbeat();
+    if (this.httpTimer) clearInterval(this.httpTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     try { this.send({ type: "leave" }); } catch { /* best effort */ }
     try { this.socket?.close(); } catch { /* already closed */ }

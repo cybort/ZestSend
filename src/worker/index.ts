@@ -110,6 +110,16 @@ function methodNotAllowed(message: string): Response {
   return Response.json({ message }, { status: 405 });
 }
 
+app.post("/api/rooms/:roomId/signal", async (context) => {
+  const roomId = context.req.param("roomId");
+  if (!roomIsValid(roomId)) return context.json({ message: "Invalid room ID." }, 400);
+  return roomFor(context.env, roomId).fetch(new Request("https://room.internal/signal", {
+    method: "POST",
+    headers: context.req.raw.headers,
+    body: context.req.raw.body,
+  }));
+});
+
 app.get("/api/rooms/:roomId/ws", async (context) => {
   const roomId = context.req.param("roomId");
   if (!roomIsValid(roomId)) return context.json({ message: "Invalid room ID." }, 400);

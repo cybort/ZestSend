@@ -37,6 +37,9 @@ type SocketAttachment = {
   lastSeenAt?: number;
   slotId?: string;
   peerSessionId?: string;
+  /** Ordinary HTTPS long-poll signaling for networks that block WebSocket upgrades. */
+  transport?: "http";
+  outbound: string[];
 };
 
 type SlotState = {
@@ -98,8 +101,11 @@ type ParsedMessage = {
 
 const MAX_PEERS = 2;
 const MAX_PENDING_SOCKETS = 8;
+const MAX_HTTP_CONNECTIONS = 4;
 const MAX_MESSAGE_BYTES = 128 * 1024;
 const HANDSHAKE_TIMEOUT_MS = 5_000;
+const HTTP_SIGNAL_TTL_MS = 45_000;
+const HTTP_OUTBOX_LIMIT = 100;
 const STORAGE_KEY = "room-state-v2";
 const textEncoder = new TextEncoder();
 
@@ -192,6 +198,7 @@ function attachmentFor(socket: WebSocket): SocketAttachment | null {
         heartbeatProtocol: "legacy-json",
         slotId: value.peerId,
         peerSessionId: value.peerId,
+        outbound: [],
       };
     }
     if (typeof value.connectionId !== "string") return null;
@@ -233,6 +240,7 @@ export class Room extends DurableObject<Env> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/mailbox/push") return this.httpPushMailbox(request);
     if (request.method === "POST" && url.pathname === "/mailbox/pull") return this.httpPullMailbox(request);
+    if (request.method === "POST" && url.pathname === "/signal") return this.httpSignal(request);
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected a WebSocket upgrade.", { status: 426 });
     }
@@ -250,7 +258,7 @@ export class Room extends DurableObject<Env> {
       }, 0);
       if (pending >= MAX_PENDING_SOCKETS) return;
 
-      server.serializeAttachment({ phase: "pending", connectionId, connectedAt } satisfies SocketAttachment);
+      server.serializeAttachment({ phase: "pending", connectionId, connectedAt, outbound: [] } satisfies SocketAttachment);
       this.ctx.acceptWebSocket(server);
       accepted = true;
       await this.scheduleAlarm();
@@ -266,24 +274,82 @@ export class Room extends DurableObject<Env> {
   }
 
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    await this.handleParsedMessage(socket, this.parseClientMessage(message), attachmentFor(socket));
+  }
+
+  /** HTTP fallback for networks where the WebSocket upgrade is blocked. */
+  private async httpSignal(request: Request): Promise<Response> {
+    const raw = await request.text();
+    if (textEncoder.encode(raw).byteLength > MAX_MESSAGE_BYTES) {
+      return Response.json({ code: "message-too-large", message: "Signaling message is too large.", type: "error" }, { status: 413 });
+    }
+    const parsed = this.parseClientMessage(raw);
+    const requestedId = request.headers.get("x-zestsend-connection");
+    let socket = requestedId ? this.ctx.getWebSockets().find((candidate) => attachmentFor(candidate)?.connectionId === requestedId) : undefined;
+    let created = false;
+    if (!socket || !socketIsLive(socket)) {
+      const pending = this.ctx.getWebSockets().filter((candidate) => {
+        const attachment = attachmentFor(candidate);
+        return attachment?.transport === "http" && attachment.phase !== "closing" && socketIsLive(candidate);
+      }).length;
+      if (pending >= MAX_HTTP_CONNECTIONS) return Response.json({ code: "room-busy", message: "Too many pending connections.", type: "error" }, { status: 429 });
+      socket = this.acceptHttpSignalingSocket();
+      created = true;
+    }
+    const delivered: string[] = [];
+    await this.handleParsedMessage(socket, parsed, attachmentFor(socket));
+    const attachment = attachmentFor(socket);
+    if (attachment) {
+      delivered.push(...attachment.outbound);
+      if (attachment.phase !== "closing") {
+        try { socket.serializeAttachment({ ...attachment, lastSeenAt: Date.now(), outbound: [] }); } catch { /* detached socket */ }
+      }
+    }
+    if (created && attachmentFor(socket)?.phase === "pending") socket.close(4_014, "Hello handshake required");
+    return new Response(delivered.join("\n"), {
+      headers: { "content-type": "application/x-ndjson", "x-zestsend-connection": attachment?.connectionId ?? socket.deserializeAttachment()?.connectionId ?? "" },
+    });
+  }
+
+  private acceptHttpSignalingSocket(): WebSocket {
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.serializeAttachment({
+      phase: "pending",
+      connectionId: crypto.randomUUID(),
+      connectedAt: Date.now(),
+      outbound: [],
+      transport: "http",
+    } satisfies SocketAttachment);
+    this.ctx.acceptWebSocket(server);
+    client.accept();
+    return server;
+  }
+
+  private parseClientMessage(message: string | ArrayBuffer): ParsedMessage | "binary" | "too-large" | "invalid" {
     const byteLength = typeof message === "string" ? textEncoder.encode(message).byteLength : message.byteLength;
-    if (byteLength > MAX_MESSAGE_BYTES) {
+    if (byteLength > MAX_MESSAGE_BYTES) return "too-large";
+    if (typeof message !== "string") return "binary";
+    try {
+      const value = JSON.parse(message) as unknown;
+      if (!isRecord(value)) return "invalid";
+      return value as ParsedMessage;
+    } catch {
+      return "invalid";
+    }
+  }
+
+  private async handleParsedMessage(socket: WebSocket, parsed: ParsedMessage | "binary" | "too-large" | "invalid", initialAttachment: SocketAttachment | null): Promise<void> {
+    if (parsed === "too-large") {
       this.sendErrorAndClose(socket, "message-too-large", "Signaling message is too large.", 4_011);
       return;
     }
-    if (typeof message !== "string") return;
-
-    let parsed: ParsedMessage;
-    try {
-      const value = JSON.parse(message) as unknown;
-      if (!isRecord(value)) throw new Error("message is not an object");
-      parsed = value as ParsedMessage;
-    } catch {
+    if (parsed === "binary") return;
+    if (parsed === "invalid") {
       this.sendErrorAndClose(socket, "invalid-message", "Invalid signaling message.", 4_012);
       return;
     }
-
-    const initialAttachment = attachmentFor(socket);
     if (parsed.type === "ping" && initialAttachment?.phase === "active") {
       this.touchActiveSocket(socket, initialAttachment);
       this.send(socket, { type: "pong" });
@@ -522,6 +588,8 @@ export class Room extends DurableObject<Env> {
       lastSeenAt: now,
       slotId: slot.slotId,
       peerSessionId: slot.peerSessionId,
+      outbound: pendingAttachment.outbound ?? [],
+      ...(pendingAttachment.transport ? { transport: pendingAttachment.transport } : {}),
     };
     socket.serializeAttachment(attachment);
     await this.saveState(state, true);
@@ -791,7 +859,8 @@ export class Room extends DurableObject<Env> {
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = attachmentFor(socket);
       if (attachment?.phase === "pending" && socketIsLive(socket)) {
-        next = Math.min(next, Math.max(now + 50, attachment.connectedAt + HANDSHAKE_TIMEOUT_MS));
+        const timeout = attachment.transport === "http" ? HTTP_SIGNAL_TTL_MS : HANDSHAKE_TIMEOUT_MS;
+        next = Math.min(next, Math.max(now + 50, attachment.connectedAt + timeout));
       }
     }
     if (state) {

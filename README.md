@@ -78,6 +78,8 @@ TURN_TOKEN=your_cloudflare_turn_api_token
 
 未配置 TURN 时，应用仍会使用公共 STUN 尝试直连；受限网络无法穿透时则不会启用中继。
 
+内网代理或防火墙拦截 `Upgrade: websocket` 时，信令会在两次 WebSocket 失败后自动改走普通 HTTPS 长轮询（`POST /api/rooms/:roomId/signal`）。房间两端可以分别使用 WebSocket 与 HTTPS，ICE、席位恢复和心跳语义保持一致。
+
 ## 远程控制 AI 代理（harness）
 
 ZestSend 房间内新增「远程」面板：通过端对端数据通道，控制另一台设备上运行的 CLI AI 编码代理（Claude Code / Copilot CLI）——发送提示词、查看流式输出、批准/拒绝工具调用，并可选执行 shell 命令与文件读写。每个房间可管理多个代理会话，随时切换且互不打断。
