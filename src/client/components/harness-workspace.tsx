@@ -236,7 +236,7 @@ export function HarnessWorkspace({ controller, locale }: { controller: HarnessCo
     : copy.idle;
 
   return (
-    <div className="flex h-full min-h-0 w-full flex-col gap-3 p-4 text-white/90">
+    <div className="flex h-full min-h-0 w-full flex-col gap-3 overflow-hidden p-4 text-white/90">
       <header className="flex flex-wrap items-center gap-3">
         <RiRobotLine size={22} className="text-white/70" />
         <div className="mr-auto">
