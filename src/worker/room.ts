@@ -229,6 +229,9 @@ function signalPayload(value: unknown): value is SignalPayload {
 
 /** A room owns the two logical WebRTC seats and their short-lived leases. */
 export class Room extends DurableObject<Env> {
+  /** Messages addressed to the HTTPS signaling socket being handled by the current request. */
+  private readonly httpOutbound = new WeakMap<WebSocket, string[]>();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(
@@ -296,18 +299,20 @@ export class Room extends DurableObject<Env> {
       socket = this.acceptHttpSignalingSocket();
       created = true;
     }
-    const delivered: string[] = [];
-    await this.handleParsedMessage(socket, parsed, attachmentFor(socket));
+    const delivered = [...(attachmentFor(socket)?.outbound ?? [])];
+    this.httpOutbound.set(socket, delivered);
+    try {
+      await this.handleParsedMessage(socket, parsed, attachmentFor(socket));
+    } finally {
+      this.httpOutbound.delete(socket);
+    }
     const attachment = attachmentFor(socket);
-    if (attachment) {
-      delivered.push(...attachment.outbound);
-      if (attachment.phase !== "closing") {
-        try { socket.serializeAttachment({ ...attachment, lastSeenAt: Date.now(), outbound: [] }); } catch { /* detached socket */ }
-      }
+    if (attachment && attachment.phase !== "closing") {
+      try { socket.serializeAttachment({ ...attachment, lastSeenAt: Date.now(), outbound: [] }); } catch { /* detached socket */ }
     }
     if (created && attachmentFor(socket)?.phase === "pending") socket.close(4_014, "Hello handshake required");
     return new Response(delivered.join("\n"), {
-      headers: { "content-type": "application/x-ndjson", "x-zestsend-connection": attachment?.connectionId ?? socket.deserializeAttachment()?.connectionId ?? "" },
+      headers: { "content-type": "text/plain; charset=utf-8", "x-zestsend-connection": attachment?.connectionId ?? socket.deserializeAttachment()?.connectionId ?? "" },
     });
   }
 
@@ -843,11 +848,13 @@ export class Room extends DurableObject<Env> {
   }
 
   private lastSignalingActivityAt(socket: WebSocket, attachment: SocketAttachment): number | null {
-    try {
-      const automaticResponse = this.ctx.getWebSocketAutoResponseTimestamp(socket);
-      if (automaticResponse) return automaticResponse.getTime();
-    } catch {
-      // Older runtime contexts may not expose timestamps for every socket.
+    if (attachment.transport !== "http") {
+      try {
+        const automaticResponse = this.ctx.getWebSocketAutoResponseTimestamp(socket);
+        if (automaticResponse) return automaticResponse.getTime();
+      } catch {
+        // Older runtime contexts may not expose timestamps for every socket.
+      }
     }
     const fallback = attachment.lastSeenAt ?? attachment.connectedAt;
     return Number.isFinite(fallback) && fallback > 0 ? fallback : null;
@@ -928,6 +935,20 @@ export class Room extends DurableObject<Env> {
   }
 
   private send(socket: WebSocket, payload: object): void {
+    const pending = this.httpOutbound.get(socket);
+    if (pending) {
+      if (pending.length >= HTTP_OUTBOX_LIMIT) return;
+      pending.push(JSON.stringify(payload));
+      return;
+    }
+    const attachment = attachmentFor(socket);
+    if (attachment?.transport === "http") {
+      if (attachment.phase === "closing" || attachment.outbound.length >= HTTP_OUTBOX_LIMIT) return;
+      try {
+        socket.serializeAttachment({ ...attachment, outbound: [...attachment.outbound, JSON.stringify(payload)] });
+      } catch { /* detached socket */ }
+      return;
+    }
     try {
       socket.send(JSON.stringify(payload));
     } catch {

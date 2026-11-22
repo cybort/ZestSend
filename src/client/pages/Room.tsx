@@ -3774,9 +3774,16 @@ export default function Room({ locale, roomId }: { locale: RoomLocale; roomId: s
         }
         setConnectionNotice(null);
         if (status.state === "reconnecting" || status.state === "reserved") {
+          const waitingForPeer = (status.detail ?? "").includes("Waiting for the other participant")
+            || (status.detail ?? "").includes("Waiting for another participant")
+            || status.p2pState === "waiting";
+          if (waitingForPeer && status.signalingState === "connected") {
+            setError(null);
+            return;
+          }
           showReconnectDialog(
             status.state === "reserved" ? "reserved"
-              : (status.detail ?? "").includes("Waiting for the other participant") || status.remoteSeatState === "grace" ? "peer-offline"
+              : waitingForPeer || status.remoteSeatState === "grace" ? "peer-offline"
               : "signaling",
             status.detail,
           );

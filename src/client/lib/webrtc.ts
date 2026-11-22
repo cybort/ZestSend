@@ -1059,7 +1059,24 @@ export class NativeWebRTCSession {
         const body = await response.text();
         if (generation !== this.socketGeneration) return;
         for (const line of body.split("\n").map((entry) => entry.trim()).filter(Boolean)) this.handleSocketMessage(line);
-        if (response.ok) this.setStep("websocket", { state: "active", detail: "HTTPS signaling fallback connected" });
+        if (response.ok && this.hasAdmittedSeat) {
+          this.reconnectAttempt = 0;
+          this.setStep("websocket", { state: "active", detail: "HTTPS signaling fallback connected" });
+          // WebSocket close latches the dialog onto "signaling is reconnecting".
+          // A successful HTTPS poll is the recovery; clear it once. Later polls
+          // must not overwrite an in-progress P2P negotiation.
+          if (this.signalingState !== "connected") {
+            const waitingForPeer = !this.remoteParticipantJoined && !this.isP2PHealthy();
+            this.reportStatus({
+              detail: waitingForPeer ? "Waiting for the other participant to join the room" : "HTTPS signaling fallback connected",
+              p2pState: this.currentP2PState(),
+              remoteSeatState: this.remoteSeatState,
+              seatState: this.seatState === "grace" ? "confirmed" : this.seatState,
+              signalingState: "connected",
+              state: "connected",
+            });
+          }
+        }
       } catch {
         if (generation === this.socketGeneration) this.setStep("websocket", { state: "checking", detail: "Retrying HTTPS signaling fallback" });
       } finally {

@@ -120,7 +120,52 @@ afterEach(() => {
   sockets.clear();
 });
 
+async function postSignal(roomId: string, body: object, connectionId?: string) {
+  const id = env.ROOMS.idFromName(roomId);
+  const stub = env.ROOMS.get(id);
+  const response = await stub.fetch("https://room.test/signal", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(connectionId ? { "x-zestsend-connection": connectionId } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const messages = (await response.text()).split("\n").map((line) => line.trim()).filter(Boolean).map((line) => JSON.parse(line) as JsonMessage);
+  return { connectionId: response.headers.get("x-zestsend-connection"), messages, status: response.status };
+}
+
 describe("Durable Object room protocol", () => {
+  it("returns HTTPS signaling events that a blocked WebSocket cannot receive", async () => {
+    const roomId = crypto.randomUUID();
+    const first = await postSignal(roomId, { type: "hello", mode: "new", capabilities: [SIGNALING_HEARTBEAT_CAPABILITY] });
+    expect(first.status).toBe(200);
+    expect(first.messages.find((message) => message.type === "welcome")).toMatchObject({ peerCount: 1 });
+    expect(first.connectionId).toBeTruthy();
+
+    const second = await postSignal(roomId, { type: "hello", mode: "new", capabilities: [SIGNALING_HEARTBEAT_CAPABILITY] });
+    const secondWelcome = second.messages.find((message) => message.type === "welcome");
+    expect(secondWelcome).toMatchObject({ peerCount: 2 });
+    expect(second.messages.some((message) => message.type === "negotiate")).toBe(true);
+
+    const deliveredToFirst = await postSignal(roomId, { type: "ping" }, first.connectionId ?? undefined);
+    expect(deliveredToFirst.messages.some((message) => message.type === "peer-ready" || message.type === "negotiate")).toBe(true);
+    expect(deliveredToFirst.messages.some((message) => message.type === "pong")).toBe(true);
+
+    const offer = { type: "offer", sdp: "v=0" };
+    const forwarded = await postSignal(roomId, {
+      type: "signal",
+      epoch: secondWelcome?.epoch,
+      peerSessionId: secondWelcome?.peerSessionId,
+      payload: { description: offer },
+    }, second.connectionId ?? undefined);
+    expect(forwarded.messages.some((message) => message.type === "error")).toBe(false);
+    const receivedByFirst = await postSignal(roomId, { type: "ping" }, first.connectionId ?? undefined);
+    expect(receivedByFirst.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "signal", payload: { description: offer } }),
+    ]));
+  });
+
   it("admits two participants and rejects a third", async () => {
     const roomId = crypto.randomUUID();
     const first = await openRoomSocket(roomId);
